@@ -1,4 +1,9 @@
-"""Step 2: tmux, git, ffmpeg and portaudio through the detected manager.
+"""Step 2: tmux, git and portaudio through the detected manager.
+
+Only what Buddy actually uses. ffmpeg was on this list once and nothing ever
+called it - speech is decoded by PyAV, which carries its own FFmpeg - so
+setup demanded, and offered to `sudo` install, a package no part of Buddy
+needed, and failed outright on a machine without it.
 
 Two rules shape this step. Nothing installs without the exact list
 being shown first, and no `sudo` runs without saying what it is for - so the
@@ -17,11 +22,11 @@ from buddy.workspace import MIN_GIT_VERSION, WorkspaceError, git_version
 
 #: Package names differ per manager for the same library; the binaries do not.
 PACKAGE_NAMES: dict[str, dict[str, str]] = {
-    "brew": {"tmux": "tmux", "git": "git", "ffmpeg": "ffmpeg", "portaudio": "portaudio"},
-    "apt": {"tmux": "tmux", "git": "git", "ffmpeg": "ffmpeg", "portaudio": "libportaudio2"},
-    "dnf": {"tmux": "tmux", "git": "git", "ffmpeg": "ffmpeg", "portaudio": "portaudio"},
-    "pacman": {"tmux": "tmux", "git": "git", "ffmpeg": "ffmpeg", "portaudio": "portaudio"},
-    "zypper": {"tmux": "tmux", "git": "git", "ffmpeg": "ffmpeg", "portaudio": "portaudio"},
+    "brew": {"tmux": "tmux", "git": "git", "portaudio": "portaudio"},
+    "apt": {"tmux": "tmux", "git": "git", "portaudio": "libportaudio2"},
+    "dnf": {"tmux": "tmux", "git": "git", "portaudio": "portaudio"},
+    "pacman": {"tmux": "tmux", "git": "git", "portaudio": "portaudio"},
+    "zypper": {"tmux": "tmux", "git": "git", "portaudio": "portaudio"},
 }
 
 INSTALL_COMMAND: dict[str, list[str]] = {
@@ -43,7 +48,7 @@ class PackagesStep(BaseStep):
     number = "2"
 
     async def _missing(self, ctx: SetupContext) -> tuple[list[str], dict[str, str]]:
-        """Which of the four are absent or too old, and what is present."""
+        """Which of the three are absent or too old, and what is present."""
         missing: list[str] = []
         pins: dict[str, str] = {}
 
@@ -60,12 +65,6 @@ class PackagesStep(BaseStep):
             pins["git"] = _version(found)
         except WorkspaceError:
             missing.append("git")
-
-        code, out, _ = await run("ffmpeg", "-version")
-        if code == 0 and out:
-            pins["ffmpeg"] = out.splitlines()[0].split(" version ")[-1].split()[0]
-        else:
-            missing.append("ffmpeg")
 
         # portaudio is a library, not a binary, so the package manager is the
         # only honest place to ask. It is needed for the microphone, so a

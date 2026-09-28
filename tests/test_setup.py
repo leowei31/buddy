@@ -612,3 +612,27 @@ async def test_the_whole_of_setup_against_this_machine(
         unchanged += ["stt", "audio"]
     for step in unchanged:
         assert by_step(repeated)[step].status is Status.SKIPPED, f"{step} did work twice"
+
+
+async def test_packages_asks_for_nothing_buddy_does_not_use(tmp_path, monkeypatch):
+    """ffmpeg was required, and offered a `sudo` install, while nothing in
+    Buddy ever ran it - speech is decoded by PyAV, which brings its own. On a
+    machine without it, setup failed; on CI it tried to install it."""
+    from buddy.setup.steps import packages
+
+    probed: list[str] = []
+    real = packages.run
+
+    async def watching(*args, **kwargs):
+        probed.append(args[0])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(packages, "run", watching)
+    ctx = make_ctx(tmp_path, no_voice=True)
+
+    missing, pins = await packages.PackagesStep()._missing(ctx)
+
+    assert missing == []
+    assert set(pins) == {"tmux", "git"}
+    assert "ffmpeg" not in probed
+    assert all("ffmpeg" not in names for names in packages.PACKAGE_NAMES.values())
