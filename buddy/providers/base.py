@@ -145,7 +145,7 @@ class CompactionHappened:
 
     `paused` is True when the request stopped at the compaction rather than
     continuing, which is what lets Buddy persist the summary, re-insert the
-    recent turns, refresh the slot table, and only then re-issue.
+    recent turns, refresh the agent table, and only then re-issue.
     """
 
     block: Compaction
@@ -192,7 +192,7 @@ class Capabilities:
     prompt_caching: bool = False
     #: Whether an operator instruction can be appended to the message list
     #: without disturbing the cached prefix. This is where Layer 0's fresh
-    #: slot table goes when it is available; otherwise the state is
+    #: agent table goes when it is available; otherwise the state is
     #: folded into the turn, which costs a cache miss every turn.
     mid_conversation_system: bool = False
     count_tokens: bool = False

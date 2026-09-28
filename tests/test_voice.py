@@ -95,9 +95,9 @@ class Recording(NullPlayback):
 
 
 def test_text_is_split_at_places_a_voice_would_pause():
-    assert split_sentences("Monday is on it. Wednesday is stuck.") == [
-        "Monday is on it.",
-        "Wednesday is stuck.",
+    assert split_sentences("Scout is on it. Fixer is stuck.") == [
+        "Scout is on it.",
+        "Fixer is stuck.",
     ]
     # Clause boundaries count: audio should start at the first natural pause,
     # not the first full stop.
@@ -109,21 +109,21 @@ def test_text_is_split_at_places_a_voice_would_pause():
 
 def test_a_tiny_fragment_is_not_worth_its_own_request():
     """A round trip to say "OK." costs more than it saves."""
-    assert split_sentences("OK. Monday has finished the migration.") == [
-        "OK. Monday has finished the migration."
+    assert split_sentences("OK. Scout has finished the migration.") == [
+        "OK. Scout has finished the migration."
     ]
 
 
 def test_streamed_text_becomes_sentences_before_the_reply_ends():
     buffer = SentenceBuffer()
     released: list[str] = []
-    for chunk in ["Monday is ", "on it. Wed", "nesday needs input. ", "Nothing else."]:
+    for chunk in ["Scout is ", "on it. Fix", "er needs input. ", "Nothing else."]:
         released.extend(buffer.feed(chunk))
     # The first sentence is available long before the last chunk arrives,
     # which is the whole reason for streaming at all.
-    assert released[0] == "Monday is on it."
+    assert released[0] == "Scout is on it."
     released.extend(buffer.flush())
-    assert released == ["Monday is on it.", "Wednesday needs input.", "Nothing else."]
+    assert released == ["Scout is on it.", "Fixer needs input.", "Nothing else."]
 
 
 def test_text_with_no_boundary_is_held_until_flush():
@@ -363,7 +363,7 @@ async def test_speech_while_buddy_is_talking_is_a_barge_in(client):
 async def test_speech_while_buddy_is_silent_is_just_a_turn(client):
     cancelled: list[str] = []
     session = VoiceSession(Narrator(client, Recording()), on_barge_in=lambda: cancelled.append("x"))
-    session.heard_speech("what is Monday doing?")
+    session.heard_speech("what is scout doing?")
 
     turn = session.heard.get_nowait()
     assert turn.barged_in is False

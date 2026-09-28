@@ -91,22 +91,23 @@
   }
   button:hover { color: var(--text); background: var(--panel); }
 
-  /* No inner scrolling: the window grows instead, up to the cap in
-     overlay.py. A panel you have to scroll is not a glance. */
-  #slots { padding: 4px 0; }
+  /* The window grows to fit, up to the cap in overlay.py. There is no limit
+     on how many agents run, so past that the list scrolls - with the ones
+     that need you first, so what matters is what is on screen. */
+  #agents { padding: 4px 0; max-height: 440px; overflow-y: auto; }
+  .quiet { padding: 8px 12px; color: var(--dim); }
 
-  .slot {
+  .agent {
     display: grid;
     /* minmax(0, ...), not 1fr: a grid column's minimum is otherwise its
-       longest unbreakable line, and five idle slot names on one line made
-       the panel wider than its window - clipping the header's summary and
+       longest unbreakable line, and a long agent name on one line made the
+       panel wider than its window - clipping the header's summary and
        fold button off the right edge. */
     grid-template-columns: 8px minmax(0, 1fr);
     gap: 8px;
     align-items: start;
     padding: 6px 12px;
   }
-  .slot.idle { opacity: 0.42; }
 
   .dot {
     width: 8px;
@@ -115,9 +116,12 @@
     border-radius: 50%;
     background: var(--status, var(--idle));
   }
-  .slot.running .dot { animation: pulse 1.6s ease-in-out infinite; }
+  /* The text column never grows past its track, or a long name pushes the
+     status and age off the panel instead of ending in an ellipsis. */
+  .agent > div:last-child { min-width: 0; }
+  .agent.running .dot { animation: pulse 1.6s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
-  @media (prefers-reduced-motion: reduce) { .slot.running .dot { animation: none } }
+  @media (prefers-reduced-motion: reduce) { .agent.running .dot { animation: none } }
 
   .who { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
   .who b {
@@ -200,7 +204,7 @@
   #reply.failed { color: var(--waiting_input); }
 
   /* Collapsed: one line you can leave on screen all day. */
-  body.collapsed #slots, body.collapsed footer, body.collapsed #composer { display: none; }
+  body.collapsed #agents, body.collapsed footer, body.collapsed #composer { display: none; }
   body.collapsed header { border-bottom: none; }
 
   .offline { padding: 14px 12px; color: var(--dim); text-align: center; }
@@ -214,7 +218,7 @@
     <span class="summary" id="summary"></span>
     <button id="fold" title="Collapse">–</button>
   </header>
-  <div id="slots"></div>
+  <div id="agents"></div>
   <div id="composer">
     <form id="sayForm" autocomplete="off">
       <span class="chev">&gt;</span>
@@ -228,7 +232,7 @@
 <script>
   "use strict";
 
-  const slotsEl = document.getElementById("slots");
+  const agentsEl = document.getElementById("agents");
   const summaryEl = document.getElementById("summary");
   const footerEl = document.getElementById("footer");
   const markEl = document.getElementById("mark");
@@ -256,23 +260,23 @@
     return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
   }
 
-  function row(slot) {
-    const status = slot.status;
-    const line = el("div", { class: `slot ${status}`, style: `--status: var(--${status})` });
+  function row(agent) {
+    const status = agent.status;
+    const line = el("div", { class: `agent ${status}`, style: `--status: var(--${status})` });
     line.append(el("div", { class: "dot" }));
 
     const body = el("div", {});
     body.append(
       el("div", { class: "who" },
-        el("b", { text: slot.name }),
-        el("span", { text: label(status) + (slot.age_seconds ? ` · ${ago(slot.age_seconds)}` : "") })
+        el("b", { text: agent.name }),
+        el("span", { text: label(status) + (agent.age_seconds ? ` · ${ago(agent.age_seconds)}` : "") })
       )
     );
-    if (slot.title) body.append(el("div", { class: "title", text: slot.title }));
-    if (slot.tail) {
+    if (agent.title) body.append(el("div", { class: "title", text: agent.title }));
+    if (agent.tail) {
       // The last line of what the agent is actually doing, not raw output:
       // the harness adapter has already turned its own format into sentences.
-      const last = slot.tail.split("\n").filter((l) => l.trim()).pop();
+      const last = agent.tail.split("\n").filter((l) => l.trim()).pop();
       if (last) body.append(el("div", { class: "doing", text: last }));
     }
     line.append(body);
@@ -280,7 +284,7 @@
   }
 
   function offline(why) {
-    slotsEl.replaceChildren(el("div", { class: "offline", text: why }));
+    agentsEl.replaceChildren(el("div", { class: "offline", text: why }));
     summaryEl.textContent = "";
     footerEl.textContent = "start a session with `buddy`";
     markEl.style.background = "var(--dim)";
@@ -288,14 +292,14 @@
   }
 
   async function refresh() {
-    let slots, queued, storm;
+    let agents, queued, storm;
     try {
       const [a, b, c] = await Promise.all([
-        fetch("/api/slots").then((r) => r.json()),
+        fetch("/api/agents").then((r) => r.json()),
         fetch("/api/tasks?state=queued&limit=100").then((r) => r.json()),
         fetch("/api/brainstorm").then((r) => r.json()),
       ]);
-      slots = a.slots;
+      agents = a.agents;
       queued = b.tasks;
       storm = c;
     } catch (_) {
@@ -304,23 +308,15 @@
     }
 
     markEl.style.background = "var(--running)";
-    // Idle slots are three lines that say nothing. One line says the same.
-    const busySlots = slots.filter((s) => s.task_id);
-    const idle = slots.filter((s) => !s.task_id).map((s) => s.name);
-    const rendered = busySlots.map(row);
-    if (idle.length) {
-      rendered.push(
-        el("div", { class: "slot idle", style: "--status: var(--idle)" },
-          el("div", { class: "dot" }),
-          el("div", {}, el("div", { class: "who" },
-            el("b", { text: idle.join(", ") }), el("span", { text: "idle" })))
-        )
-      );
-    }
-    slotsEl.replaceChildren(...rendered);
+    const needsYou = (a) => a.status === "waiting_input" || a.status === "stalled";
+    const attention = agents.filter(needsYou);
+    // The ones that need you first, then the API's order: most urgent first.
+    const ordered = [...attention, ...agents.filter((a) => !needsYou(a))];
+    agentsEl.replaceChildren(
+      ...(ordered.length ? ordered.map(row) : [el("div", { class: "quiet", text: "no agents running" })])
+    );
 
-    const busy = slots.filter((s) => s.occupied).length;
-    const attention = slots.filter((s) => s.status === "waiting_input" || s.status === "stalled");
+    const busy = agents.length;
     const drafts = storm.drafts.length;
     // Something needing you outranks brainstorming; brainstorming outranks a count.
     summaryEl.textContent = attention.length
@@ -342,7 +338,7 @@
 
   /* The panel is exactly as tall as what it is showing. A fixed height means
      either a cropped list or a slab of empty black in the corner of a screen
-     - and the number of busy slots changes all day. */
+     - and the number of running agents changes all day. */
   let lastHeight = 0;
   let bridgeReady = false;
   window.addEventListener("pywebviewready", () => {

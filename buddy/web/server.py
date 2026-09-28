@@ -1,7 +1,7 @@
 """FastAPI: routes, websockets, and log tailing.
 
 Embedded in the Buddy process and running in the same asyncio loop as the
-manager. Live slot state comes from `AgentManager`, history from the
+manager. Live agent state comes from `AgentManager`, history from the
 database, and output from tailing the log files `pipe-pane` is already
 writing - there is no second polling loop and no `capture-pane` diffing.
 
@@ -34,7 +34,7 @@ from buddy.config import Config
 from buddy.ideation import Brainstorm
 from buddy.logs import tail
 from buddy.manager import AgentManager
-from buddy.models import SLOT_NAMES, AgentSlot, TaskRun, TaskSpec, TaskState
+from buddy.models import Agent, TaskRun, TaskSpec, TaskState
 from buddy.state import Store
 from buddy.web.events import CONVERSATION, EVENTS, Hub, jsonable
 from buddy.workspace import Workspace, WorkspaceError, branch_name
@@ -68,19 +68,12 @@ def _seconds_since(then: datetime | None, now: datetime) -> int | None:
     return None if then is None else max(0, int((now - then).total_seconds()))
 
 
-def _slot_sort_key(slot: AgentSlot) -> tuple[bool, int, int]:
-    """Sorted by priority, with unassigned slots last and the week's
-    order as the tie-break so cards never swap places between polls."""
-    order = {name: index for index, name in enumerate(SLOT_NAMES)}
-    return (slot.priority is None, slot.priority or 0, order[slot.name])
-
-
 def run_payload(run: TaskRun) -> dict[str, Any]:
     log = run.log_path
     return {
         "task_id": run.task_id,
         "attempt": run.attempt,
-        "slot": run.slot,
+        "agent": run.agent,
         "branch": run.branch,
         "base_ref": run.base_ref,
         "worktree": str(run.worktree),
@@ -98,6 +91,7 @@ def run_payload(run: TaskRun) -> dict[str, Any]:
 def task_payload(task: TaskSpec, state: TaskState | None) -> dict[str, Any]:
     return {
         "id": task.id,
+        "agent": task.agent,
         "title": task.title,
         "project": task.project,
         "harness": task.harness,
@@ -217,7 +211,7 @@ async def tail_log(
     Yields the bytes exactly as `pipe-pane` wrote them, escapes and all, which
     is the whole reason the browser renders this with xterm.js.
 
-    A log that does not exist yet is waited for rather than refused: a slot
+    A log that does not exist yet is waited for rather than refused: an agent
     can be connected to before its `pipe-pane` has written a byte.
     """
     offset = -1  # nothing read yet
@@ -272,29 +266,24 @@ def create_app(
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(LOOPBACK_HOSTS))
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
-    def slot_payload(slot: AgentSlot, now: datetime) -> dict[str, Any]:
-        task = store.get_task(slot.task_id) if slot.task_id else None
-        run = (
-            store.get_run(slot.task_id, slot.run_attempt)
-            if slot.task_id and slot.run_attempt
-            else None
-        )
+    def agent_payload(agent: Agent, now: datetime) -> dict[str, Any]:
+        task = store.get_task(agent.task_id)
+        run = store.get_run(agent.task_id, agent.run_attempt)
         return {
-            "name": slot.name,
-            "status": jsonable(slot.status),
-            "occupied": slot.status.is_occupied,
-            "task_id": slot.task_id,
-            "attempt": slot.run_attempt,
+            "name": agent.name,
+            "status": jsonable(agent.status),
+            "task_id": agent.task_id,
+            "attempt": agent.run_attempt,
             "title": task.title if task else None,
             "project": task.project if task else None,
-            "harness": slot.harness,
-            "priority": slot.priority,
+            "harness": agent.harness,
+            "priority": agent.priority,
             "branch": run.branch if run else None,
-            "started_at": jsonable(slot.started_at),
-            "age_seconds": _seconds_since(slot.started_at, now),
-            "last_output_at": jsonable(slot.last_output_at),
-            "last_output_ago_seconds": _seconds_since(slot.last_output_at, now),
-            "tail": tail(slot.last_output, 3),
+            "started_at": jsonable(agent.started_at),
+            "age_seconds": _seconds_since(agent.started_at, now),
+            "last_output_at": jsonable(agent.last_output_at),
+            "last_output_ago_seconds": _seconds_since(agent.last_output_at, now),
+            "tail": tail(agent.last_output, 3),
         }
 
     def queue_row(task: TaskSpec, state: TaskState | None) -> dict[str, Any]:
@@ -304,13 +293,9 @@ def create_app(
         payload["branch"] = run.branch if run else None
         payload["outcome"] = jsonable(run.outcome) if run else None
         payload["ended_at"] = jsonable(run.ended_at) if run else None
-        # The live slot while it holds the task, and the slot it last ran in
-        # once it does not: a finished task saying "nowhere" is less true than
-        # saying where the work happened.
-        payload["slot"] = next(
-            (slot.name for slot in manager.slots() if slot.task_id == task.id),
-            run.slot if run else None,
-        )
+        # Whether its agent is running right now, which the name alone does
+        # not say: a queued or finished task has a name and no window.
+        payload["running"] = any(agent.task_id == task.id for agent in manager.agents())
         if state is TaskState.QUEUED:
             blocked = manager.dependency_block(task)
             payload["waiting_for"] = blocked
@@ -342,14 +327,15 @@ def create_app(
 
     # -- the API -----------------------------------------------------------
 
-    @app.get("/api/slots")
-    async def slots() -> dict[str, Any]:
+    @app.get("/api/agents")
+    async def agents() -> dict[str, Any]:
+        """Every running agent, most urgent first. `max_concurrent` is null
+        when there is no limit."""
         now = manager.now()
-        ordered = sorted(manager.slots(), key=_slot_sort_key)
         return {
             "now": jsonable(now),
             "max_concurrent": manager.max_concurrent,
-            "slots": [slot_payload(slot, now) for slot in ordered],
+            "agents": [agent_payload(agent, now) for agent in manager.agents()],
         }
 
     @app.get("/api/brainstorm")

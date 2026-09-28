@@ -54,8 +54,9 @@ class LayoutStep(BaseStep):
         # created private rather than world-readable.
         paths.keys.mkdir(parents=True, exist_ok=True)
         paths.keys.chmod(0o700)
-        with Store(paths.db) as store:
-            store.ensure_slots()
+        # Opening the store creates the database and runs every migration.
+        with Store(paths.db):
+            pass
         ctx.ui.detail(f"{paths.home} ready, schema v{SCHEMA_VERSION}")
 
     async def verify(self, ctx: SetupContext) -> str:
@@ -65,7 +66,5 @@ class LayoutStep(BaseStep):
                 f"the layout is still not right: {result.detail}",
                 hint=f"Check permissions on {ctx.paths.home}.",
             )
-        with Store(ctx.paths.db) as store:
-            slots = len(store.load_slots())
         config = Config(home=ctx.home)
-        return f"{config.paths.home}, {result.detail}, {slots} slots"
+        return f"{config.paths.home}, {result.detail}"

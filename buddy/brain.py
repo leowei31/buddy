@@ -27,7 +27,15 @@ from buddy import conflicts
 from buddy.config import Config, ConfigError
 from buddy.ideation import ACTING_TOOLS, DRAFT_ID, Brainstorm, Draft
 from buddy.manager import AgentManager, StalePreemption
-from buddy.models import BrainstormChanged, TaskFinished, TaskSpec, TaskStarted, TaskState
+from buddy.models import (
+    AgentNameError,
+    BrainstormChanged,
+    TaskFinished,
+    TaskSpec,
+    TaskStarted,
+    TaskState,
+    check_agent_name,
+)
 from buddy.providers.base import (
     Compaction,
     CompactionHappened,
@@ -62,7 +70,7 @@ PRESERVE, concretely and in order:
 2. Decisions made and the reasons given - including things the user said
    NOT to do.
 3. For every task id mentioned (t-XXXX): the intent behind it and any
-   nuance not captured in its title. Do NOT record its status, slot, or
+   nuance not captured in its title. Do NOT record its status, agent, or
    branch - those are supplied fresh from the database.
 4. Open threads: questions the user hasn't answered, things you said
    you'd follow up on, ideas parked for later.
@@ -70,15 +78,17 @@ PRESERVE, concretely and in order:
    how much narration they want).
 6. Anything the user explicitly asked you to remember.
 
-OMIT: slot status, tool outputs, log excerpts, file contents, and
+OMIT: agent status, tool outputs, log excerpts, file contents, and
 anything you could re-fetch with a tool. Prefer the user's phrasing over
 your paraphrase where the distinction matters."""
 
 
 SYSTEM_PROMPT = """\
-You are Buddy. You orchestrate a team of up to 7 coding agents named
-Monday through Sunday. Each runs in its own tmux window and its own git
-worktree; the user can attach to any window at any time.
+You are Buddy. You orchestrate a team of coding agents, as many as the
+work needs. Each has a name - the one the user gave it, or one made from
+its title - and runs in its own tmux window and its own git worktree; the
+user can attach to any agent's window at any time. Refer to agents by
+name. When the user names an agent, pass that name exactly.
 
 The user thinks out loud. Converse naturally. When their intent is clear
 enough to act on, write a brief (Goal / Context / Constraints / Definition
@@ -266,7 +276,7 @@ class ProjectTools:
         return text
 
     #: Scanned at most, however broad the glob. A repository is not a bounded
-    #: input, and this runs while seven agents are being supervised.
+    #: input, and this runs while agents are being supervised.
     GREP_MAX_FILES = 2000
     GREP_MAX_FILE_BYTES = 1_000_000
     #: The longest line a pattern is run against.
@@ -365,11 +375,11 @@ class ProjectTools:
 class ContextManager:
     """Five layers, cheapest and most continuous first.
 
-    Layer 0 is the load-bearing one: slots, the queue, task states, branches
-    and outcomes are never *remembered*, they are re-read from SQLite and
-    injected fresh every turn. That is why compaction can never hallucinate
-    task state - a summary that says "Tuesday was working on auth" can be
-    wrong; the slot table cannot.
+    Layer 0 is the load-bearing one: running agents, the queue, task states,
+    branches and outcomes are never *remembered*, they are re-read from
+    SQLite and injected fresh every turn. That is why compaction can never
+    hallucinate task state - a summary that says "scout was working on auth"
+    can be wrong; the agent table cannot.
     """
 
     config: Config
@@ -403,16 +413,16 @@ class ContextManager:
     # -- Layer 0: state is re-read, never remembered ----------------------
 
     def state_block(self, manager: AgentManager) -> str:
-        """The slot table and queue, fresh from SQLite, every turn."""
-        lines = ["Current slots:"]
-        for row in manager.list_agents():
-            detail = (
-                f'{row["task_id"]} "{row["title"]}" p{row["priority"]} on {row["branch"]}'
-                if row["task_id"]
-                else "-"
-            )
+        """The running agents and the queue, fresh from SQLite, every turn."""
+        rows = manager.list_agents()
+        lines = ["Running agents:" if rows else "Running agents: none"]
+        for row in rows[: self.STATE_AGENT_LINES]:
+            detail = f'{row["task_id"]} "{row["title"]}" p{row["priority"]} on {row["branch"]}'
             age = f", {row['age_seconds'] // 60}m" if row["age_seconds"] else ""
-            lines.append(f"  {row['slot']:10} {row['status']:14} {detail}{age}")
+            lines.append(f"  {row['agent']:16} {row['status']:14} {detail}{age}")
+        if len(rows) > self.STATE_AGENT_LINES:
+            # Sent every turn, so bounded; list_agents has the rest.
+            lines.append(f"  ... and {len(rows) - self.STATE_AGENT_LINES} more running")
 
         queued = self.store.tasks_in_state(TaskState.QUEUED)
         if queued:
@@ -420,7 +430,7 @@ class ContextManager:
             for task in queued[: self.STATE_QUEUE_LINES]:
                 blocked = manager.dependency_block(task)
                 lines.append(
-                    f"  {task.id} p{task.priority} {task.title}"
+                    f"  {task.agent} ({task.id}) p{task.priority} {task.title}"
                     + (f" - {blocked}" if blocked else "")
                 )
             if len(queued) > self.STATE_QUEUE_LINES:
@@ -431,7 +441,8 @@ class ContextManager:
             lines.append("Queue: empty")
         return "\n".join(lines)
 
-    #: Queue lines in the per-turn state block.
+    #: Running-agent and queue lines in the per-turn state block.
+    STATE_AGENT_LINES = 25
     STATE_QUEUE_LINES = 25
     #: Characters of pinned facts in the per-turn memory block.
     MEMORY_CHARS = 8000
@@ -814,6 +825,11 @@ class Brain:
     them, so the same set works everywhere.
     """
 
+    #: Model requests one turn may make while it keeps calling tools. Enough
+    #: for a spawn, a few reads and a reply; a model looping on tools is
+    #: stopped rather than billed forever.
+    MAX_TOOL_ROUNDS = 15
+
     def __init__(
         self,
         config: Config,
@@ -889,6 +905,11 @@ class Brain:
         brief_fields = {
             "project": {**string, "description": projects},
             "title": string,
+            "name": {
+                **string,
+                "description": "What to call the agent, when the user named it: use their "
+                "name exactly. Leave it out otherwise and Buddy names it from the title.",
+            },
             "goal": string,
             "context": string,
             "constraints": string,
@@ -931,7 +952,10 @@ class Brain:
                 "The user said to go ahead: show them the drafts and, on their yes, start "
                 "every one and end the brainstorm.",
             ),
-            ToolDef("list_agents", "The slot table, sorted by priority, with a short log tail."),
+            ToolDef(
+                "list_agents",
+                "Every running agent, by name and most urgent first, with a short log tail.",
+            ),
             ToolDef(
                 "spawn_agent",
                 "Queue a task. Write the brief yourself: goal, context, constraints, and a "
@@ -955,8 +979,8 @@ class Brain:
             ),
             ToolDef(
                 "kill_agent",
-                "Kill the task in a slot. Its work is checkpointed; it is not retried.",
-                {"type": "object", "properties": {"slot": string}, "required": ["slot"]},
+                "Kill a running agent, by name. Its work is checkpointed; it is not retried.",
+                {"type": "object", "properties": {"agent": string}, "required": ["agent"]},
             ),
             ToolDef(
                 "reprioritize",
@@ -969,7 +993,8 @@ class Brain:
             ),
             ToolDef(
                 "get_output",
-                "Tail of a slot's or task's log, ANSI stripped.",
+                "Tail of an agent's or a task's log, ANSI stripped. Target is an agent's "
+                "name or a task id.",
                 {
                     "type": "object",
                     "properties": {"target": string, "lines": {"type": "integer"}},
@@ -1151,17 +1176,24 @@ class Brain:
         priority: int = 0,
         depends_on: list[str] | None = None,
         merge_required: bool = False,
+        name: str = "",
     ) -> ToolOutcome:
         self.config.project(project)  # raises with the known names if unknown
         chosen = await self._usable_harness(project, harness)
         rank = _valid_priority(priority or self.config.buddy.default_priority)
         wanted = _valid_model(model)
         blocked = list(_valid_dependencies(depends_on))
+        # Checked before the read-back, so nobody confirms a spawn that
+        # could only fail - and the read-back names the agent it will be.
+        try:
+            agent = self.manager.claim_name(str(name or ""), title)
+        except AgentNameError as exc:
+            raise ToolArgumentError(str(exc)) from exc
 
         # The model is named in the read-back because it ends up on a command
         # line. Quoting stops it being executable; showing it is what
         # stops a crafted one being approved unseen.
-        detail = f"{title} - {chosen}"
+        detail = f"{agent}: {title} - {chosen}"
         if wanted:
             detail += f" on {wanted}"
         if blocked:
@@ -1187,6 +1219,7 @@ class Brain:
             priority=rank,
             depends_on=blocked,
             merge_required=merge_required,
+            name=agent,
         )
         return ToolOutcome(said)
 
@@ -1201,8 +1234,9 @@ class Brain:
         priority: int,
         depends_on: list[str],
         merge_required: bool = False,
+        name: str = "",
     ) -> tuple[str, str]:
-        """Create the task and let the scheduler place it. Validated already."""
+        """Create the task and let the scheduler start it. Validated already."""
         task = TaskSpec(
             id=self.store.next_task_id(),
             title=title,
@@ -1216,9 +1250,12 @@ class Brain:
             max_runtime=self.config.buddy.max_runtime,
             stall_timeout=self.config.buddy.stall_timeout,
             created_from_utterance=self._last_user_utterance(),
+            agent=name,
         )
         try:
             events = await self.manager.submit(task)
+        except AgentNameError:
+            raise
         except Exception as exc:
             # `submit` saves the task before it schedules. If only the
             # scheduling failed, the task exists and will start on a later
@@ -1226,16 +1263,20 @@ class Brain:
             # a retry create the same work twice.
             if self.store.get_task(task.id) is None:
                 raise
-            return task.id, f"{task.id} queued; it could not be started yet ({exc})"
+            return task.id, (
+                f"{task.id} queued as {task.agent}; it could not be started yet ({exc})"
+            )
         self.pending_events.extend(events)
         for event in events:
             if isinstance(event, TaskFinished) and event.task_id == task.id:
-                return task.id, f"{task.id} could not start: {event.summary}"
+                return task.id, f"{task.id} ({task.agent}) could not start: {event.summary}"
             if isinstance(event, TaskStarted) and event.task_id == task.id:
-                return task.id, f"{task.id} started on {event.slot}"
+                return task.id, f"{task.id} started as {event.agent}"
         ahead = self.manager.queue_position(task.id)
         blocked = self.manager.dependency_block(task)
-        return task.id, f"{task.id} queued " + (blocked or f"behind {ahead} task(s)")
+        return task.id, f"{task.id} queued as {task.agent}, " + (
+            blocked or f"behind {ahead} task(s)"
+        )
 
     # brainstorming (buddy.ideation)
 
@@ -1270,8 +1311,15 @@ class Brain:
         priority: int = 0,
         after: list[str] | None = None,
         draft_id: str = "",
+        name: str = "",
     ) -> ToolOutcome:
         self.config.project(project)
+        # The form is checked now; whether the name is free is a question
+        # for when the draft launches, since agents come and go meanwhile.
+        try:
+            agent = check_agent_name(name) if str(name or "").strip() else ""
+        except AgentNameError as exc:
+            raise ToolArgumentError(str(exc)) from exc
         if harness and harness not in self.config.runnable_harnesses():
             known = ", ".join(self.config.runnable_harnesses())
             raise ToolArgumentError(f"{harness!r} is not a configured harness. Use one of: {known}")
@@ -1293,6 +1341,7 @@ class Brain:
                 model=_valid_model(model),
                 priority=_valid_priority(priority) if priority else 0,
                 after=refs,
+                name=agent,
             )
         )
         return ToolOutcome(f"{'revised' if revising else 'drafted'} {draft.line()}")
@@ -1369,6 +1418,7 @@ class Brain:
                     model=draft.model,
                     priority=draft.priority or self.config.buddy.default_priority,
                     depends_on=[started.get(ref, ref) for ref in draft.after],
+                    name=draft.name,
                 )
             except Exception as exc:  # noqa: BLE001 - one draft, not the hand-off
                 kept.append(f"{draft.line()}: {exc}")
@@ -1415,14 +1465,17 @@ class Brain:
                 )
         return chosen
 
-    async def _tool_kill_agent(self, slot: str) -> ToolOutcome:
-        row = self.manager._slot(slot)
-        if not row.task_id:
-            return ToolOutcome(f"{slot} is {row.status.value}; nothing to kill")
-        if not self._confirmed("kill_agent", f"Kill {row.task_id} on {slot}? It is mid-work."):
+    async def _tool_kill_agent(self, agent: str) -> ToolOutcome:
+        running = self.manager.agent(str(agent))
+        if running is None:
+            names = ", ".join(a.name for a in self.manager.agents()) or "none"
+            return ToolOutcome(f"no running agent is called {agent}; running now: {names}")
+        if not self._confirmed(
+            "kill_agent", f"Kill {running.name} ({running.task_id})? It is mid-work."
+        ):
             raise ConfirmationDeclined("left it running")
-        self.pending_events.extend(await self.manager.kill_agent(slot))
-        return ToolOutcome(f"killed {row.task_id} on {slot}")
+        self.pending_events.extend(await self.manager.kill_agent(running.name))
+        return ToolOutcome(f"killed {running.name} ({running.task_id})")
 
     async def _tool_reprioritize(self, task_id: str, priority: int) -> str:
         rank = _valid_priority(priority)
@@ -1444,7 +1497,7 @@ class Brain:
             return ToolOutcome(f"no such proposal: {proposal_id}")
         if not self._confirmed(
             "accept_preemption",
-            f"Preempt {proposal.victim_task_id} on {proposal.victim_slot} "
+            f"Preempt {proposal.victim_agent} ({proposal.victim_task_id}) "
             f"for {proposal.incoming_task_id}? Its work is checkpointed and it is requeued.",
         ):
             self.manager.decline_preemption(proposal_id)
@@ -1610,7 +1663,7 @@ class Brain:
             self.messages.append(Turn.user(utterance))
 
         reply_parts: list[str] = []
-        for _ in range(self.config.buddy.max_concurrent + 8):  # a bounded tool loop
+        for _ in range(self.MAX_TOOL_ROUNDS):
             system = self.context.system_prompt(self.manager)
             await self._prepare_context(system)
             messages = self._with_state(system)
@@ -1686,7 +1739,7 @@ class Brain:
             self.messages, _ = await self.context.compact_client_side(system, self.messages, tools)
 
     def _with_state(self, system: str) -> list[Turn]:
-        """Layer 0: the live slot table, injected fresh every turn.
+        """Layer 0: the running agents and the queue, injected fresh every turn.
 
         Where the provider supports a mid-conversation operator instruction
         it goes in as one, which keeps the cached prefix intact. Where it does

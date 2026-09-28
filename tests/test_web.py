@@ -26,8 +26,9 @@ from buddy.config import Config
 from buddy.harnesses.claude_code import ClaudeCodeAdapter
 from buddy.manager import AgentManager
 from buddy.models import (
+    Agent,
+    AgentStatus,
     RunOutcome,
-    SlotStatus,
     TaskFinished,
     TaskRun,
     TaskSpec,
@@ -74,7 +75,6 @@ def config(tmp_path: Path, repo: Path) -> Config:
 @pytest.fixture
 def store(config: Config) -> Store:
     with Store(config.paths.db) as opened:
-        opened.ensure_slots()
         yield opened
 
 
@@ -85,8 +85,6 @@ def workspace(config: Config) -> Workspace:
 
 class NullRunner:
     """The dashboard never touches tmux, so neither does this."""
-
-    async def ensure_session(self, slots=None) -> None: ...
 
     async def panes(self) -> dict:
         return {}
@@ -144,14 +142,14 @@ def make_task(store: Store, *, state: TaskState = TaskState.QUEUED, **overrides)
     return task
 
 
-def make_run(config: Config, task: TaskSpec, *, slot: str = "Monday", attempt: int = 1) -> TaskRun:
+def make_run(config: Config, task: TaskSpec, *, attempt: int = 1) -> TaskRun:
     log = config.paths.log_file(task.id, attempt)
     log.parent.mkdir(parents=True, exist_ok=True)
     log.touch()
     return TaskRun(
         task_id=task.id,
         attempt=attempt,
-        slot=slot,
+        agent=task.agent,
         worktree=Path("/tmp/unused"),
         branch=branch_name(task),
         base_ref="HEAD",
@@ -176,7 +174,7 @@ def test_no_route_can_change_anything(app):
 def test_websocket_routes_match_the_design(app):
     paths = {getattr(route, "path", None) for route in app.routes}
     assert {"/ws/events", "/ws/conversation", "/ws/logs/{task_id}/{attempt}"} <= paths
-    assert {"/api/slots", "/api/tasks", "/api/tasks/{task_id}", "/api/conversation"} <= paths
+    assert {"/api/agents", "/api/tasks", "/api/tasks/{task_id}", "/api/conversation"} <= paths
 
 
 # -- pages -----------------------------------------------------------------
@@ -234,42 +232,45 @@ async def test_a_brainstorm_change_reaches_the_event_socket_as_its_own_type():
     assert payload["active"] is True and payload["drafts"] == 2
 
 
-# -- GET /api/slots --------------------------------------------------------
+# -- GET /api/agents -------------------------------------------------------
 
 
-async def test_slots_lists_all_seven_sorted_by_priority(client, store, config):
-    task = make_task(store, priority=1, title="Urgent thing")
-    run = make_run(config, task, slot="Friday")
-    store.create_run(run)
-    slot = next(s for s in store.load_slots() if s.name == "Friday")
-    slot.status = SlotStatus.RUNNING
-    slot.task_id = task.id
-    slot.run_attempt = 1
-    slot.harness = "claude_code"
-    slot.priority = 1
-    slot.started_at = utcnow() - timedelta(minutes=3)
-    slot.last_output_at = utcnow() - timedelta(seconds=20)
-    slot.last_output = "line one\nline two\nline three\nline four"
-    store.save_slot(slot)
+async def test_agents_lists_the_running_ones_most_urgent_first(client, store, config):
+    task = make_task(store, priority=1, title="Urgent thing", agent="firefighter")
+    store.create_run(make_run(config, task))
+    store.save_agent(
+        Agent(
+            name="firefighter",
+            task_id=task.id,
+            run_attempt=1,
+            status=AgentStatus.RUNNING,
+            harness="claude_code",
+            priority=1,
+            started_at=utcnow() - timedelta(minutes=3),
+            last_output_at=utcnow() - timedelta(seconds=20),
+            last_output="line one\nline two\nline three\nline four",
+        )
+    )
+    other = make_task(store, priority=4, title="Later", agent="tidier")
+    store.save_agent(Agent("tidier", other.id, 1, priority=4, started_at=utcnow()))
 
-    body = (await client.get("/api/slots")).json()
-    assert [s["name"] for s in body["slots"]][0] == "Friday"
-    assert len(body["slots"]) == 7
+    body = (await client.get("/api/agents")).json()
+    assert [a["name"] for a in body["agents"]] == ["firefighter", "tidier"]
+    assert body["max_concurrent"] is None, "no limit unless one is set"
 
-    friday = body["slots"][0]
-    assert friday["status"] == "running"
-    assert friday["occupied"] is True
-    assert friday["title"] == "Urgent thing"
-    assert friday["branch"] == branch_name(task)
-    assert friday["project"] == "webapp"
-    assert 170 <= friday["age_seconds"] <= 200
-    assert friday["last_output_ago_seconds"] >= 19
+    firefighter = body["agents"][0]
+    assert firefighter["status"] == "running"
+    assert firefighter["title"] == "Urgent thing"
+    assert firefighter["branch"] == branch_name(task)
+    assert firefighter["project"] == "webapp"
+    assert 170 <= firefighter["age_seconds"] <= 200
+    assert firefighter["last_output_ago_seconds"] >= 19
     # Three lines, the "last-output" summary on the card.
-    assert friday["tail"].splitlines() == ["line two", "line three", "line four"]
+    assert firefighter["tail"].splitlines() == ["line two", "line three", "line four"]
 
-    idle = [s for s in body["slots"] if s["name"] != "Friday"]
-    assert all(s["status"] == "idle" and s["task_id"] is None for s in idle)
-    assert all(s["age_seconds"] is None for s in idle)
+
+async def test_with_nothing_running_there_are_no_agents(client):
+    assert (await client.get("/api/agents")).json()["agents"] == []
 
 
 # -- GET /api/tasks --------------------------------------------------------
@@ -364,14 +365,14 @@ async def test_task_with_no_branch_reports_why_rather_than_failing(client, store
     assert body["diff_error"]  # a git message, not a 500
 
 
-async def test_a_finished_task_still_names_the_slot_it_ran_in(client, store, config):
-    task = make_task(store, state=TaskState.DONE)
-    store.create_run(make_run(config, task, slot="Saturday"))
+async def test_a_task_names_its_agent_running_or_not(client, store, config):
+    task = make_task(store, state=TaskState.DONE, agent="scout")
+    store.create_run(make_run(config, task))
 
     body = (await client.get(f"/api/tasks/{task.id}")).json()
-    # The slot has long since been handed to something else; where the work
-    # happened is still the useful answer.
-    assert body["task"]["slot"] == "Saturday"
+    assert body["task"]["agent"] == "scout"
+    assert body["task"]["running"] is False
+    assert body["runs"][0]["agent"] == "scout"
 
 
 async def test_unknown_task_is_a_404(client):
@@ -405,12 +406,12 @@ async def test_conversation_backfills_oldest_first_and_pages_backwards(client, s
 async def test_events_reach_an_open_socket(server: Dashboard, hub: Hub):
     async with websockets.connect(f"ws://127.0.0.1:{server.port}/ws/events") as ws:
         await wait_for(lambda: hub.subscribers(EVENTS) == 1)
-        hub.publish_events([TaskStarted(task_id="t-0001", slot="Monday", attempt=2)])
+        hub.publish_events([TaskStarted(task_id="t-0001", agent="scout", attempt=2)])
         payload = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
 
     assert payload["type"] == "TaskStarted"
     assert payload["task_id"] == "t-0001"
-    assert payload["slot"] == "Monday"
+    assert payload["agent"] == "scout"
     assert payload["attempt"] == 2
     assert payload["at"].endswith("+00:00")
 
@@ -428,13 +429,13 @@ async def test_conversation_turns_are_pushed_as_the_brain_writes_them(
     store.on_turn(hub.publish_turn)
     async with websockets.connect(f"ws://127.0.0.1:{server.port}/ws/conversation") as ws:
         await wait_for(lambda: hub.subscribers("conversation") == 1)
-        store.log_turn("user", "spawn something on Monday")
+        store.log_turn("user", "spawn scout on webapp")
         first = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        store.log_turn("buddy", "Monday is on it")
+        store.log_turn("buddy", "scout is on it")
         second = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
 
-    assert (first["speaker"], first["text"]) == ("user", "spawn something on Monday")
-    assert (second["speaker"], second["text"]) == ("buddy", "Monday is on it")
+    assert (first["speaker"], first["text"]) == ("user", "spawn scout on webapp")
+    assert (second["speaker"], second["text"]) == ("buddy", "scout is on it")
     assert second["id"] > first["id"]
 
 
@@ -538,14 +539,14 @@ async def test_a_stalled_subscriber_drops_the_oldest_and_never_blocks():
 
 def test_publishing_with_nobody_listening_is_free():
     hub = Hub()
-    hub.publish_events([TaskStarted(task_id="t-1", slot="Monday")])
+    hub.publish_events([TaskStarted(task_id="t-1", agent="scout")])
     assert hub.subscribers(EVENTS) == 0
 
 
 def test_event_payload_keeps_every_field_and_names_the_type():
     event = TaskFinished(
         task_id="t-0007",
-        slot="Sunday",
+        agent="scout",
         attempt=2,
         outcome=RunOutcome.TIMEOUT,
         exit_code=124,
@@ -561,7 +562,7 @@ def test_event_payload_keeps_every_field_and_names_the_type():
 
 def test_jsonable_handles_the_types_events_actually_carry():
     assert jsonable(Path("/tmp/x.log")) == "/tmp/x.log"
-    assert jsonable(SlotStatus.WAITING_INPUT) == "waiting_input"
+    assert jsonable(AgentStatus.WAITING_INPUT) == "waiting_input"
     assert jsonable([RunOutcome.DONE, None]) == ["done", None]
     assert jsonable({"outcome": RunOutcome.ERROR}) == {"outcome": "error"}
 
@@ -589,7 +590,7 @@ async def test_a_taken_port_is_explained_rather_than_fatal(
 
     # The one that was already there is untouched.
     async with httpx.AsyncClient(base_url=server.url, timeout=10) as client:
-        assert (await client.get("/api/slots")).status_code == 200
+        assert (await client.get("/api/agents")).status_code == 200
 
 
 async def test_stopping_twice_is_harmless(app):
@@ -642,11 +643,11 @@ async def test_a_rebound_hostname_reads_nothing(server):
     `Host: attacker.example` read `/api/conversation` with a 200."""
     rebound = {"Host": f"attacker.example:{server.port}"}
     async with httpx.AsyncClient(base_url=server.url, timeout=10) as client:
-        for path in ("/api/conversation", "/api/slots", "/api/tasks", "/"):
+        for path in ("/api/conversation", "/api/agents", "/api/tasks", "/"):
             assert (await client.get(path, headers=rebound)).status_code == 400, path
-        assert (await client.get("/api/slots")).status_code == 200
+        assert (await client.get("/api/agents")).status_code == 200
         localhost = {"Host": f"localhost:{server.port}"}
-        assert (await client.get("/api/slots", headers=localhost)).status_code == 200
+        assert (await client.get("/api/agents", headers=localhost)).status_code == 200
 
     url = f"ws://127.0.0.1:{server.port}/ws/conversation"
     with pytest.raises(websockets.exceptions.InvalidStatus) as refused:
@@ -659,7 +660,7 @@ async def test_the_dashboards_own_page_still_connects(server, hub):
     url = f"ws://127.0.0.1:{server.port}/ws/events"
     async with websockets.connect(url, additional_headers={"Origin": origin}) as ws:
         await wait_for(lambda: hub.subscribers(EVENTS) == 1)
-        hub.publish_events([TaskStarted(task_id="t-0001", slot="Monday")])
+        hub.publish_events([TaskStarted(task_id="t-0001", agent="scout")])
         assert json.loads(await asyncio.wait_for(ws.recv(), timeout=5))["task_id"] == "t-0001"
 
 

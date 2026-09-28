@@ -16,7 +16,7 @@ import pytest
 from buddy.config import Config
 from buddy.harnesses.claude_code import ClaudeCodeAdapter
 from buddy.manager import AgentManager
-from buddy.models import RunOutcome, SlotStatus, TaskRun, TaskSpec, TaskState
+from buddy.models import RunOutcome, TaskRun, TaskSpec, TaskState
 from buddy.state import Store
 from buddy.workspace import Workspace, branch_name
 
@@ -54,7 +54,6 @@ def config(tmp_path: Path, repo: Path) -> Config:
 @pytest.fixture
 def store(config: Config) -> Store:
     with Store(config.paths.db) as opened:
-        opened.ensure_slots()
         yield opened
 
 
@@ -65,22 +64,22 @@ class FakeRunner:
         self.killed: list[str] = []
         self.session_killed = False
 
-    async def ensure_session(self, slots=None) -> None: ...
-
     async def panes(self) -> dict:
         return {}
 
-    async def spawn(self, slot: str, run, script: Path) -> None:
+    async def spawn(self, agent: str, run, script: Path) -> None:
         run.log_path.parent.mkdir(parents=True, exist_ok=True)
         run.log_path.touch()
 
-    async def kill(self, slot: str) -> None:
-        self.killed.append(slot)
+    async def kill(self, agent: str) -> None:
+        self.killed.append(agent)
+
+    async def close_window(self, agent: str) -> None: ...
 
     async def kill_session(self) -> None:
         self.session_killed = True
 
-    async def close_pipe(self, slot: str) -> bool:
+    async def close_pipe(self, agent: str) -> bool:
         return True
 
 
@@ -168,13 +167,13 @@ async def test_memory_and_the_conversation_are_untouched(manager, store, config)
     """
     store.remember("prefers base.en for speech")
     store.log_turn("user", "spawn something on webapp")
-    store.log_turn("buddy", "Monday is on it")
+    store.log_turn("buddy", "scout is on it")
     task = await start(manager, store)
 
     await manager.shutdown()
 
     assert [fact["fact"] for fact in store.memories()] == ["prefers base.en for speech"]
-    assert [turn["text"] for turn in store.recent_turns(10)][-1] == "Monday is on it"
+    assert [turn["text"] for turn in store.recent_turns(10)][-1] == "scout is on it"
     assert store.search_turns("spawn"), "the FTS index still answers"
     assert store.get_task(task.id) is not None
     assert store.runs_for(task.id), "the attempt's history is still there"
@@ -288,8 +287,7 @@ async def test_a_finished_task_keeps_its_branch_and_loses_its_worktree(
     run: TaskRun = store.latest_run(task.id)
     await Workspace(config).checkpoint(run, RunOutcome.DONE)
     store.set_task_state(task.id, TaskState.DONE)
-    slot = next(s for s in manager.slots() if s.task_id == task.id)
-    manager._clear_slot(slot, SlotStatus.DONE)
+    store.remove_agent(task.agent)  # finished, so no longer running
 
     await manager.shutdown()
 

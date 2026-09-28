@@ -47,7 +47,7 @@ def make_run(tmp_path: Path, attempt: int = 1, branch: str = "buddy/t-0142-fix")
     return TaskRun(
         task_id="t-0142",
         attempt=attempt,
-        slot="Tuesday",
+        agent="scout",
         worktree=worktree,
         branch=branch,
         base_ref="abc1234",

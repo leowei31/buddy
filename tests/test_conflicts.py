@@ -54,7 +54,6 @@ def world(tmp_path: Path, repo: Path):
     )
     config = Config.load(home=tmp_path)
     with Store(config.paths.db) as store:
-        store.ensure_slots()
         workspace = Workspace(config)
         manager = AgentManager(
             config,

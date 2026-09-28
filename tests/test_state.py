@@ -6,16 +6,16 @@ from pathlib import Path
 import pytest
 
 from buddy.models import (
-    SLOT_NAMES,
-    AgentSlot,
+    Agent,
+    AgentNameError,
+    AgentStatus,
     RunOutcome,
-    SlotStatus,
     TaskRun,
     TaskSpec,
     TaskState,
     utcnow,
 )
-from buddy.state import SCHEMA_VERSION, StateError, Store
+from buddy.state import MIGRATIONS, SCHEMA_VERSION, StateError, Store
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def make_run(task: TaskSpec, attempt: int = 1) -> TaskRun:
     return TaskRun(
         task_id=task.id,
         attempt=attempt,
-        slot="Tuesday",
+        agent=task.agent or "scout",
         worktree=Path("/tmp/wt") / task.id,
         branch=f"buddy/{task.id}-fix-onboarding",
         base_ref="abc1234",
@@ -59,13 +59,13 @@ def test_wal_and_schema_version(store: Store, tmp_path: Path):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
-def test_all_seven_tables_from_section_3_5_exist(store: Store):
+def test_every_table_exists(store: Store):
     names = {
         row[0]
         for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table')")
     }
     assert {
-        "slots",
+        "agents",
         "tasks",
         "task_runs",
         "conversation_log",
@@ -78,10 +78,9 @@ def test_all_seven_tables_from_section_3_5_exist(store: Store):
 def test_reopening_is_idempotent(tmp_path: Path):
     path = tmp_path / "state.db"
     with Store(path) as first:
-        first.ensure_slots()
         make_task(first)
     with Store(path) as second:
-        assert len(second.load_slots()) == 7
+        assert second.schema_version() == SCHEMA_VERSION
         assert second.next_task_id() == "t-0002"
 
 
@@ -97,41 +96,71 @@ def test_future_schema_is_refused(tmp_path: Path):
         Store(path)
 
 
-# -- slots -----------------------------------------------------------------
+# -- agents ----------------------------------------------------------------
 
 
-def test_ensure_slots_creates_seven_idle_slots_once(store: Store):
-    slots = store.ensure_slots()
-    assert [s.name for s in slots] == list(SLOT_NAMES)
-    assert all(s.status is SlotStatus.IDLE for s in slots)
-    assert all(s.tmux_window == s.name for s in slots)
-
-    # Idempotent, and it never clobbers live state: the name is a handle.
-    slots[1].status = SlotStatus.RUNNING
-    slots[1].task_id = "t-0001"
-    store.save_slot(slots[1])
-    again = store.ensure_slots()
-    assert again[1].status is SlotStatus.RUNNING
-    assert again[1].task_id == "t-0001"
-
-
-def test_slot_round_trip(store: Store):
-    store.ensure_slots()
+def test_an_agent_round_trips_and_is_found_whatever_its_case(store: Store):
     now = utcnow()
-    slot = AgentSlot(
-        name="Thursday",
-        status=SlotStatus.WAITING_INPUT,
+    agent = Agent(
+        name="Scout",
         task_id="t-0007",
         run_attempt=2,
+        status=AgentStatus.WAITING_INPUT,
         harness="opencode",
         priority=1,
         started_at=now,
         last_output_at=now,
         last_output="waiting on y/n",
     )
-    store.save_slot(slot)
-    loaded = {s.name: s for s in store.load_slots()}["Thursday"]
-    assert loaded == slot
+    store.save_agent(agent)
+
+    assert store.get_agent("scout") == agent
+    assert store.load_agents() == [agent]
+    store.remove_agent("SCOUT")
+    assert store.load_agents() == []
+
+
+def test_running_agents_come_most_urgent_first_then_oldest(store: Store):
+    now = utcnow()
+    for name, priority, age in (("late", 2, 1), ("early", 2, 5), ("urgent", 1, 0)):
+        store.save_agent(
+            Agent(name, f"t-{name}", 1, priority=priority, started_at=now - timedelta(minutes=age))
+        )
+    assert [a.name for a in store.load_agents()] == ["urgent", "early", "late"]
+
+
+def test_a_task_saved_without_a_name_is_given_one_from_its_title(store: Store):
+    first = make_task(store, title="Add rate limiting to the API")
+    second = make_task(store, title="Add rate limiting to the API")
+    assert first.agent == "add-rate-limiting"
+    assert second.agent == "add-rate-limiting-2"
+    assert store.get_task(second.id).agent == "add-rate-limiting-2"
+
+
+def test_two_live_tasks_can_never_share_a_name(store: Store):
+    """Enforced by the database, not only by the manager: two processes
+    racing for one name must not both win."""
+    make_task(store, agent="scout")
+    with pytest.raises(AgentNameError, match="Scout is already t-0001"):
+        make_task(store, agent="Scout")
+
+
+def test_a_finished_agents_name_is_free_again(store: Store):
+    first = make_task(store, agent="scout")
+    store.set_task_state(first.id, TaskState.DONE)
+    second = make_task(store, agent="scout")
+    assert store.live_agent_names() == {"scout": second.id}
+
+
+def test_a_name_refers_to_the_live_task_and_otherwise_to_the_latest(store: Store):
+    old = make_task(store, agent="scout")
+    store.set_task_state(old.id, TaskState.DONE)
+    assert store.task_for_agent("SCOUT").id == old.id
+
+    live = make_task(store, agent="scout")
+    assert store.task_for_agent("scout").id == live.id
+    assert store.find_task(old.id).id == old.id, "an id still finds exactly its task"
+    assert store.find_task("nobody") is None
 
 
 # -- tasks -----------------------------------------------------------------
@@ -318,7 +347,6 @@ def test_the_database_is_private_even_when_it_already_existed(tmp_path):
     config = Config(home=home)
     config.paths.ensure()
     with Store(config.paths.db) as store:
-        store.ensure_slots()
         store.log_turn("user", "my key is sk-not-really")
 
     assert st.S_IMODE(home.stat().st_mode) == 0o700
@@ -355,3 +383,46 @@ def test_a_conflict_fix_round_trips_what_it_resolves_and_where_it_starts(store):
     again = store.get_task("t-0002")
     assert again.resolves == "t-0001"
     assert again.start_from == "buddy/t-0001-add-limits"
+
+
+def test_a_running_slot_becomes_an_agent_of_the_same_name_on_upgrade(tmp_path):
+    """Upgrading from seven fixed slots, mid-run. A slot's name was also its
+    tmux window's, so keeping it as the agent's name means the window that
+    is running right now is still found - and nothing is interrupted."""
+    import sqlite3
+
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(MIGRATIONS[0] + MIGRATIONS[1] + "PRAGMA user_version=2;")
+    insert = (
+        "INSERT INTO tasks (id, title, brief, harness, project, priority, max_runtime_s, "
+        "stall_timeout_s, created_at, state) VALUES (?, 't', 'b', 'claude_code', 'webapp', 3, "
+        "7200, 600, ?, ?)"
+    )
+    conn.execute(insert, ("t-0001", "2026-01-01T00:00:00+00:00", "running"))
+    conn.execute(insert, ("t-0002", "2026-01-02T00:00:00+00:00", "queued"))
+    conn.execute(
+        "INSERT INTO task_runs (task_id, attempt, slot, worktree, branch, base_ref, log_path, "
+        "started_at) VALUES ('t-0001', 1, 'Tuesday', '/w', 'b', 'r', '/l', "
+        "'2026-01-01T00:00:00+00:00')"
+    )
+    for name in ("Monday", "Tuesday"):
+        conn.execute(
+            "INSERT INTO slots (name, status, tmux_window) VALUES (?, 'idle', ?)", (name, name)
+        )
+    conn.execute(
+        "UPDATE slots SET status = 'running', task_id = 't-0001', run_attempt = 1, "
+        "last_output = 'working' WHERE name = 'Tuesday'"
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        assert store.schema_version() == SCHEMA_VERSION
+        assert [(a.name, a.task_id, a.last_output) for a in store.load_agents()] == [
+            ("Tuesday", "t-0001", "working")
+        ]
+        assert store.get_task("t-0001").agent == "Tuesday"
+        assert store.get_run("t-0001", 1).agent == "Tuesday"
+        assert store.get_task("t-0002").agent == "t-0002", "every other task is named for its id"
+        assert "slots" not in store.table_names()

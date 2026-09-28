@@ -2,7 +2,7 @@
 
 The dashboard is where you *look* at Buddy; this is what stays on screen
 while you look at something else. A small frameless window, above other
-windows, showing the seven slots and what each agent is doing right now.
+windows, showing every running agent and what it is doing right now.
 
 It is a separate process on purpose, and that is not an implementation
 detail:
@@ -39,7 +39,7 @@ from typing import Any
 
 #: Small enough to leave in a corner, wide enough for a task title. The
 #: height is a starting point only: the page measures itself and asks the
-#: window to fit, because the number of busy slots changes all day.
+#: window to fit, because the number of running agents changes all day.
 DEFAULT_WIDTH = 330
 DEFAULT_HEIGHT = 240
 MAX_HEIGHT = 620
@@ -79,22 +79,21 @@ def top_right(width: int = DEFAULT_WIDTH, margin: int = 24) -> Corner:
 def dashboard_is_up(url: str, *, timeout: float = 1.5) -> bool:
     """Whether a session is running with its dashboard on."""
     try:
-        with urllib.request.urlopen(f"{url}/api/slots", timeout=timeout) as response:
+        with urllib.request.urlopen(f"{url}/api/agents", timeout=timeout) as response:
             return response.status == 200
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
 
 def summarise(url: str, *, timeout: float = 2.0) -> str:
-    """One line about the slots, for a terminal that cannot draw a window."""
+    """One line about the agents, for a terminal that cannot draw a window."""
     try:
-        with urllib.request.urlopen(f"{url}/api/slots", timeout=timeout) as response:
-            slots = json.load(response)["slots"]
+        with urllib.request.urlopen(f"{url}/api/agents", timeout=timeout) as response:
+            agents = json.load(response)["agents"]
     except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         return f"Buddy is not reachable at {url} ({type(exc).__name__})"
-    busy = [s for s in slots if s["occupied"]]
-    attention = [s["name"] for s in slots if s["status"] in ("waiting_input", "stalled")]
-    line = f"{len(busy)} running"
+    attention = [a["name"] for a in agents if a["status"] in ("waiting_input", "stalled")]
+    line = f"{len(agents)} running"
     if attention:
         verb = "needs" if len(attention) == 1 else "need"
         line += f", and {', '.join(attention)} {verb} you"

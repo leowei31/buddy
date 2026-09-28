@@ -31,7 +31,7 @@ TEMPLATE = """\
 # here is only the name to look up.
 
 [buddy]
-max_concurrent   = 7
+max_concurrent   = 0              # agents running at once; 0 = no limit
 default_priority = 3
 stall_timeout    = "10m"          # no output for this long -> notify, never kill
 max_runtime      = "2h"           # then checkpoint, requeue once, error the second time

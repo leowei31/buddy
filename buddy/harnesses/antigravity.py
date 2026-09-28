@@ -30,7 +30,7 @@ Four things about `agy` that are easy to get wrong, all found by running it:
   `--disable-slash-commands` is passed.
 * **Signed out, it does not fail.** It prints a sign-in URL and waits for
   someone to paste a code. That is what the waiting patterns match, so the
-  slot says it needs you instead of looking busy.
+  agent says it needs you instead of looking busy.
 """
 
 from __future__ import annotations
@@ -164,7 +164,7 @@ def _prompt_requirement(help_text: str) -> Requirement:
 
 
 def describe_events(log_text: str, limit: int = 20) -> list[str]:
-    """`agy`'s stream-json as sentences for a slot card."""
+    """`agy`'s stream-json as sentences for an agent card."""
     described: list[str] = []
     for event in stream.events(log_text):
         if isinstance(event, str):

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from buddy.models import SLOT_NAMES, TaskRun
+from buddy.models import TaskRun
 from buddy.tmux_runner import (
     MIN_TMUX_VERSION,
     PaneStatus,
@@ -52,11 +52,11 @@ def runner(tmux_socket: str) -> TmuxRunner:
     return TmuxRunner(session="buddy-test", socket_name=tmux_socket)
 
 
-def make_run(tmp_path: Path, slot: str = "Monday", attempt: int = 1) -> TaskRun:
+def make_run(tmp_path: Path, agent: str = "scout", attempt: int = 1) -> TaskRun:
     return TaskRun(
         task_id="t-0001",
         attempt=attempt,
-        slot=slot,
+        agent=agent,
         worktree=tmp_path / "wt",
         branch="buddy/t-0001-test",
         base_ref="HEAD",
@@ -77,29 +77,51 @@ async def test_version_is_new_enough_for_pane_dead_status(runner: TmuxRunner):
     assert await runner.check_version() >= MIN_TMUX_VERSION
 
 
-# -- session and windows -------------------------------------------
+# -- one window per agent --------------------------------------------------
 
 
-async def test_ensure_session_creates_seven_named_windows(runner: TmuxRunner):
-    await runner.ensure_session()
-    assert await runner.session_exists()
-    assert set(await runner.windows()) == set(SLOT_NAMES)
-
-
-async def test_ensure_session_is_idempotent_and_leaves_running_work_alone(
+async def test_the_first_agent_brings_the_session_and_the_last_takes_it(
     runner: TmuxRunner, tmp_path: Path
 ):
-    await runner.ensure_session()
-    run = make_run(tmp_path)
-    await runner.spawn("Monday", run, script(tmp_path, "echo alive; sleep 30"))
-    before = await runner.status("Monday")
+    """There is no fixed set of windows to create up front: each agent's is
+    made when it starts, and tmux ends a session with its last window."""
+    assert not await runner.session_exists()
 
-    await runner.ensure_session()
+    await runner.spawn("scout", make_run(tmp_path, "scout"), script(tmp_path, "sleep 30"))
+    await runner.spawn("fixer", make_run(tmp_path, "fixer"), script(tmp_path, "sleep 30", "b.sh"))
+    assert sorted(await runner.windows()) == ["fixer", "scout"]
 
-    after = await runner.status("Monday")
+    await runner.close_window("scout")
+    assert await runner.windows() == ["fixer"]
+    await runner.close_window("fixer")
+    assert not await runner.session_exists()
+
+
+async def test_opening_a_window_leaves_running_work_alone(runner: TmuxRunner, tmp_path: Path):
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "echo alive; sleep 30"))
+    before = await runner.status("scout")
+
+    await runner.open_window("scout")
+
+    after = await runner.status("scout")
     assert after.alive
     assert after.pid == before.pid  # the pane was never respawned
-    assert set(await runner.windows()) == set(SLOT_NAMES)
+    assert await runner.windows() == ["scout"]
+
+
+async def test_a_window_made_by_hand_still_reports_its_exit(runner: TmuxRunner, tmp_path: Path):
+    """`remain-on-exit` is what keeps a dead pane and its status. A window
+    someone made by hand does not have it, so it is set on every spawn."""
+    await runner._call("new-session", "-d", "-s", runner.session, "-n", "scout")
+
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "exit 7"))
+
+    assert (await wait_for(lambda: _dead(runner, "scout"))).exit_code == 7
+
+
+async def test_a_name_in_any_script_is_a_window(runner: TmuxRunner, tmp_path: Path):
+    await runner.spawn("écrivain-2", make_run(tmp_path, "écrivain-2"), script(tmp_path, "exit 0"))
+    assert (await wait_for(lambda: _dead(runner, "écrivain-2"))).exit_code == 0
 
 
 # -- completion detection ------------------------------------------
@@ -109,78 +131,80 @@ async def test_ensure_session_is_idempotent_and_leaves_running_work_alone(
 async def test_pane_goes_dead_and_reports_its_exit_code(
     runner: TmuxRunner, tmp_path: Path, exit_code: int
 ):
-    await runner.ensure_session()
     run = make_run(tmp_path)
-    await runner.spawn("Monday", run, script(tmp_path, f"echo working; exit {exit_code}"))
+    await runner.spawn("scout", run, script(tmp_path, f"echo working; exit {exit_code}"))
 
-    status = await wait_for(lambda: _dead(runner, "Monday"))
+    status = await wait_for(lambda: _dead(runner, "scout"))
     assert status.dead
     assert status.exit_code == exit_code
 
 
-async def _dead(runner: TmuxRunner, slot: str) -> PaneStatus | None:
-    status = await runner.status(slot)
+async def _dead(runner: TmuxRunner, agent: str) -> PaneStatus | None:
+    status = await runner.status(agent)
     return status if status.dead else None
 
 
 async def test_a_running_pane_reports_alive_with_no_exit_code(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
-    await runner.spawn("Tuesday", make_run(tmp_path, "Tuesday"), script(tmp_path, "sleep 30"))
-    status = await runner.status("Tuesday")
+    await runner.spawn("fixer", make_run(tmp_path, "fixer"), script(tmp_path, "sleep 30"))
+    status = await runner.status("fixer")
     assert status.alive
     assert status.exit_code is None
     assert status.pid
 
 
-async def test_status_of_a_missing_window_says_so(runner: TmuxRunner):
+async def test_status_of_a_missing_window_says_so(runner: TmuxRunner, tmp_path: Path):
     """The restart case: tmux was killed underneath a run."""
-    assert await runner.status("Monday") == PaneStatus(exists=False)
-    await runner.ensure_session()
+    assert await runner.status("scout") == PaneStatus(exists=False)
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "sleep 30"))
     await runner.kill_session()
-    assert not (await runner.status("Monday")).exists
+    assert not (await runner.status("scout")).exists
 
 
-async def test_a_slot_name_is_never_prefix_matched_onto_another_window(runner: TmuxRunner):
+async def test_a_name_is_never_prefix_matched_onto_another_window(
+    runner: TmuxRunner, tmp_path: Path
+):
     """Without the `=` prefix, tmux resolves an unknown window name to any
-    window it prefixes, so `Mon` would silently act on `Monday`."""
-    await runner.ensure_session()
-    assert not await runner.window_exists("Mon")
-    assert not (await runner.status("Mon")).exists
+    window it prefixes, so `scout` would silently act on `scout-2`."""
+    await runner.spawn("scout-2", make_run(tmp_path, "scout-2"), script(tmp_path, "sleep 30"))
+    assert not await runner.window_exists("scout")
+    assert not (await runner.status("scout")).exists
 
 
-async def test_a_missing_window_never_reports_another_slots_pane(
+async def test_a_missing_window_never_reports_another_agents_pane(
     runner: TmuxRunner, tmp_path: Path
 ):
     """Regression: `display -p -t <session>:<window>` answers for the
     session's *current* window when the target does not resolve. Reporting a
-    live pane for a slot whose window is gone would defeat reconciliation."""
-    await runner.ensure_session()
-    await runner.spawn("Monday", make_run(tmp_path), script(tmp_path, "sleep 30"))
-    assert (await runner.status("Monday")).alive
+    live pane for an agent whose window is gone would defeat reconciliation."""
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "sleep 30"))
+    await runner.spawn("fixer", make_run(tmp_path, "fixer"), script(tmp_path, "sleep 30", "b.sh"))
+    assert (await runner.status("scout")).alive
 
-    assert not (await runner.status("Mon")).exists
+    assert not (await runner.status("sco")).exists
     assert not (await runner.status("Nonexistent")).exists
 
-    await runner._tmux("kill-window", "-t", runner.target("Monday"))
-    assert not (await runner.status("Monday")).exists
+    await runner._tmux("kill-window", "-t", runner.target("scout"))
+    assert not (await runner.status("scout")).exists
 
 
-async def test_panes_reports_every_slot_in_one_call(runner: TmuxRunner):
-    await runner.ensure_session()
+async def test_panes_reports_every_agent_in_one_call(runner: TmuxRunner, tmp_path: Path):
+    for index, name in enumerate(("a", "b", "c")):
+        await runner.spawn(
+            name, make_run(tmp_path, name), script(tmp_path, "sleep 30", f"{index}.sh")
+        )
     panes = await runner.panes()
-    assert set(panes) == set(SLOT_NAMES)
+    assert set(panes) == {"a", "b", "c"}
     assert all(status.alive for status in panes.values())
 
 
 async def test_a_neighbouring_window_is_left_alone(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
-    await runner._tmux("new-window", "-d", "-t", "buddy-test", "-n", "Mon")
+    await runner._call("new-session", "-d", "-s", runner.session, "-n", "sco")
 
-    await runner.spawn("Monday", make_run(tmp_path), script(tmp_path, "exit 3"))
-    dead = await wait_for(lambda: _dead(runner, "Monday"))
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "exit 3"))
+    dead = await wait_for(lambda: _dead(runner, "scout"))
 
     assert dead.exit_code == 3
-    decoy = await runner.status("Mon")
+    decoy = await runner.status("sco")
     assert decoy.alive and not decoy.piped
 
 
@@ -188,32 +212,31 @@ async def test_a_neighbouring_window_is_left_alone(runner: TmuxRunner, tmp_path:
 
 
 async def test_pipe_pane_writes_an_append_only_log(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
     run = make_run(tmp_path)
-    await runner.spawn("Monday", run, script(tmp_path, "sleep 0.25; echo __BUDDY_MARKER__; exit 0"))
+    await runner.spawn("scout", run, script(tmp_path, "sleep 0.25; echo __BUDDY_MARKER__; exit 0"))
     await wait_for(lambda: run.log_path.exists() and "__BUDDY_MARKER__" in run.log_path.read_text())
-    assert (await runner.status("Monday")).piped
+    assert (await runner.status("scout")).piped
 
 
 async def test_the_pipe_is_open_immediately_after_respawn(runner: TmuxRunner, tmp_path: Path):
     """Verify, and reopen if respawn dropped it."""
-    await runner.ensure_session()
     run = make_run(tmp_path)
-    await runner.spawn("Monday", run, script(tmp_path, "sleep 0.25; echo hello; sleep 5"))
-    assert await runner.is_piped("Monday")
+    await runner.spawn("scout", run, script(tmp_path, "sleep 0.25; echo hello; sleep 5"))
+    assert await runner.is_piped("scout")
 
 
 async def test_a_second_attempt_writes_a_separate_log(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
+    """A retry reuses its agent's window when one is still there."""
     first = make_run(tmp_path, attempt=1)
-    await runner.spawn("Monday", first, script(tmp_path, "sleep 0.25; echo FIRST; exit 0"))
+    await runner.spawn("scout", first, script(tmp_path, "sleep 0.25; echo FIRST; exit 0"))
     await wait_for(lambda: "FIRST" in _read(first.log_path))
 
     second = make_run(tmp_path, attempt=2)
-    await runner.spawn("Monday", second, script(tmp_path, "sleep 0.25; echo SECOND; exit 0"))
+    await runner.spawn("scout", second, script(tmp_path, "sleep 0.25; echo SECOND; exit 0"))
     await wait_for(lambda: "SECOND" in _read(second.log_path))
 
     assert "SECOND" not in first.log_path.read_text()
+    assert await runner.windows() == ["scout"]
 
 
 async def test_a_capped_log_rotates_mid_burst_losing_nothing(tmux_socket, tmp_path: Path):
@@ -224,10 +247,9 @@ async def test_a_capped_log_rotates_mid_burst_losing_nothing(tmux_socket, tmp_pa
     import re
 
     runner = TmuxRunner(session="buddy-test", socket_name=tmux_socket, max_log_bytes=250_000)
-    await runner.ensure_session()
     run = make_run(tmp_path)
     body = "sleep 0.25; for i in $(seq 1 30000); do echo line-$i; done; echo __ALL_DONE__; sleep 5"
-    await runner.spawn("Monday", run, script(tmp_path, body))
+    await runner.spawn("scout", run, script(tmp_path, body))
 
     await wait_for(lambda: "__ALL_DONE__" in _read(run.log_path), seconds=30)
     rotated = run.log_path.with_name(run.log_path.name + ".1")
@@ -242,16 +264,15 @@ def _read(path: Path) -> str:
 
 
 async def test_capture_shows_the_screen(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
     await runner.spawn(
-        "Monday", make_run(tmp_path), script(tmp_path, "echo ON_SCREEN_NOW; sleep 30")
+        "scout", make_run(tmp_path), script(tmp_path, "echo ON_SCREEN_NOW; sleep 30")
     )
-    screen = await wait_for(lambda: _captured(runner, "Monday", "ON_SCREEN_NOW"))
+    screen = await wait_for(lambda: _captured(runner, "scout", "ON_SCREEN_NOW"))
     assert "ON_SCREEN_NOW" in screen
 
 
-async def _captured(runner: TmuxRunner, slot: str, needle: str) -> str | None:
-    screen = await runner.capture(slot)
+async def _captured(runner: TmuxRunner, agent: str, needle: str) -> str | None:
+    screen = await runner.capture(agent)
     return screen if needle in screen else None
 
 
@@ -260,7 +281,6 @@ async def _captured(runner: TmuxRunner, slot: str, needle: str) -> str | None:
 
 async def test_kill_takes_the_whole_process_tree(runner: TmuxRunner, tmp_path: Path):
     """A dev server or watcher the harness started must not outlive the task."""
-    await runner.ensure_session()
     pids_file = tmp_path / "pids"
     body = (
         "sleep 300 & child=$!\n"
@@ -268,11 +288,11 @@ async def test_kill_takes_the_whole_process_tree(runner: TmuxRunner, tmp_path: P
         f'echo "$child $grandchild $$" > {pids_file}\n'
         "wait"
     )
-    await runner.spawn("Wednesday", make_run(tmp_path, "Wednesday"), script(tmp_path, body))
+    await runner.spawn("builder", make_run(tmp_path, "builder"), script(tmp_path, body))
     await wait_for(lambda: pids_file.exists() and len(pids_file.read_text().split()) == 3)
     child, grandchild, shell = (int(p) for p in pids_file.read_text().split())
 
-    await runner.kill("Wednesday")
+    await runner.kill("builder")
 
     for pid in (child, grandchild, shell):
         await wait_for(lambda pid=pid: not _pid_alive(pid), seconds=15)
@@ -288,21 +308,25 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-async def test_kill_returns_the_slot_to_an_idle_shell(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
-    await runner.spawn("Thursday", make_run(tmp_path, "Thursday"), script(tmp_path, "sleep 300"))
-    await runner.kill("Thursday")
-    status = await runner.status("Thursday")
-    assert status.alive  # a fresh shell, ready for the next task
-    assert not status.piped  # the log pipe was closed
+async def test_kill_removes_the_agents_window(runner: TmuxRunner, tmp_path: Path):
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "sleep 300"))
+    await runner.spawn("fixer", make_run(tmp_path, "fixer"), script(tmp_path, "sleep 300", "b.sh"))
+
+    await runner.kill("scout")
+
+    assert not (await runner.status("scout")).exists
+    assert (await runner.status("fixer")).alive, "a neighbour is untouched"
 
 
 async def test_kill_is_safe_on_an_already_dead_pane(runner: TmuxRunner, tmp_path: Path):
-    await runner.ensure_session()
-    await runner.spawn("Friday", make_run(tmp_path, "Friday"), script(tmp_path, "exit 0"))
-    await wait_for(lambda: _dead(runner, "Friday"))
-    await runner.kill("Friday")
-    assert (await runner.status("Friday")).alive
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "exit 0"))
+    await wait_for(lambda: _dead(runner, "scout"))
+    await runner.kill("scout")
+    assert not (await runner.status("scout")).exists
+
+
+async def test_closing_a_window_that_is_not_there_is_harmless(runner: TmuxRunner):
+    await runner.close_window("nobody")
 
 
 # -- process-tree helpers --------------------------------------------------

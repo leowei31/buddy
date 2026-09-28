@@ -26,7 +26,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from buddy.models import SLOT_NAMES, TaskRun
+from buddy.models import TaskRun
 from buddy.processes import release
 
 #: tmux ≥ 3.0 is required for `pane_dead_status`.
@@ -84,7 +84,6 @@ class TmuxRunner:
         # Tests run against their own tmux server so they can never disturb
         # the user's real `buddy` session.
         self._socket = socket_name
-        self._options_applied = False
 
     # -- process plumbing --------------------------------------------------
 
@@ -112,11 +111,11 @@ class TmuxRunner:
             raise TmuxError(f"tmux {' '.join(args)} failed ({code}): {err.strip() or out.strip()}")
         return out
 
-    def target(self, slot: str) -> str:
-        """`buddy:=Monday`. The `=` forces an exact window-name match so tmux
-        never resolves a slot to a prefix of another window's name: without
-        it, `Mon` would match `Monday`."""
-        return f"{self.session}:={slot}"
+    def target(self, agent: str) -> str:
+        """`buddy:=scout`. The `=` forces an exact window-name match so tmux
+        never resolves an agent to a prefix of another window's name: without
+        it, `scout` would match `scout-2`."""
+        return f"{self.session}:={agent}"
 
     @property
     def _session_exact(self) -> str:
@@ -129,8 +128,8 @@ class TmuxRunner:
     def _session_target(self) -> str:
         """Plain `buddy`. `set-option` and `kill-session` reject the `=`
         prefix outright (verified against tmux 3.7), and by the time either
-        runs, `ensure_session` has guaranteed a session of exactly this name,
-        which tmux matches before it ever considers a prefix."""
+        runs a session of exactly this name exists, which tmux matches before
+        it ever considers a prefix."""
         return self.session
 
     # -- session and windows ---------------------------------------
@@ -161,8 +160,8 @@ class TmuxRunner:
         code, _, _ = await self._call("has-session", "-t", self._session_exact)
         return code == 0
 
-    async def window_exists(self, slot: str) -> bool:
-        return slot in await self.windows()
+    async def window_exists(self, agent: str) -> bool:
+        return agent in await self.windows()
 
     async def windows(self) -> list[str]:
         if not await self.session_exists():
@@ -170,65 +169,66 @@ class TmuxRunner:
         out = await self._tmux("list-windows", "-t", self._session_exact, "-F", "#{window_name}")
         return [line for line in out.splitlines() if line]
 
-    async def ensure_session(self, slots: tuple[str, ...] = SLOT_NAMES) -> None:
-        """Create the session and its windows if missing.
+    async def open_window(self, agent: str) -> None:
+        """A window for one agent, created if it is not there.
 
-        Idempotent, and it never touches a window that already exists, because
-        that window may be running a task right now. Cheap enough to
-        call on every scheduling pass: in the steady state it costs one
-        `has-session` and one `list-windows`, and only re-applies the window
-        options when something was actually created or when this process has
-        not applied them yet. That last condition matters, because a window
-        someone made by hand would not have `remain-on-exit` and completion
-        detection would silently stop working.
+        One window per running agent, made when it starts and removed when
+        it ends, so there is no fixed set to create up front and no limit
+        but the one in config. The session itself is created with the first
+        window and ends with the last, as tmux sessions do.
+
+        `remain-on-exit` is set on every call, not only on creation: it is
+        what makes a pane survive its command's exit and keep the status,
+        and a window someone made by hand would not have it.
         """
-        exists = await self.session_exists()
-        existing = set(await self.windows()) if exists else set()
-        created = False
-
-        if not exists:
-            first = slots[0]
-            await self._tmux("new-session", "-d", "-s", self.session, "-n", first)
-            await self._tmux(
-                "set-option",
-                "-t",
-                self._session_target,
-                "history-limit",
-                str(DEFAULT_HISTORY_LIMIT),
-            )
-            existing = {first}
-            created = True
-
-        for slot in slots:
-            if slot not in existing:
-                await self._tmux("new-window", "-d", "-t", self._session_target, "-n", slot)
-                created = True
-
-        if created or not self._options_applied:
-            for slot in slots:
-                # Set per window rather than relying on a global: this is what
-                # makes a pane survive its command's exit and keep the status.
-                await self._tmux(
-                    "set-option", "-t", self.target(slot), "-w", "remain-on-exit", "on"
+        if not await self.window_exists(agent):
+            if await self.session_exists():
+                await self._tmux("new-window", "-d", "-t", self._session_target, "-n", agent)
+            else:
+                code, out, err = await self._call(
+                    "new-session", "-d", "-s", self.session, "-n", agent
                 )
-            self._options_applied = True
+                if code != 0 and "duplicate session" in (err + out):
+                    # Created by someone else between the check and now.
+                    await self._tmux("new-window", "-d", "-t", self._session_target, "-n", agent)
+                elif code != 0:
+                    raise TmuxError(f"tmux new-session failed ({code}): {err.strip() or out}")
+                else:
+                    await self._tmux(
+                        "set-option",
+                        "-t",
+                        self._session_target,
+                        "history-limit",
+                        str(DEFAULT_HISTORY_LIMIT),
+                    )
+        await self._tmux("set-option", "-t", self.target(agent), "-w", "remain-on-exit", "on")
+
+    async def close_window(self, agent: str) -> None:
+        """Remove an agent's window once its attempt is over.
+
+        The pipe goes first, so nothing the pane prints on its way out is
+        appended to a finished attempt's log.
+        """
+        if not await self.window_exists(agent):
+            return
+        await self.close_pipe(agent)
+        await self._call("kill-window", "-t", self.target(agent))
 
     async def kill_session(self) -> None:
         """`buddy uninstall` and test teardown."""
         await self._call("kill-session", "-t", self._session_target)
-        self._options_applied = False
 
     # -- logging ----------------------------------------------------
 
-    async def _pipe_pane(self, slot: str, command: str | None = None) -> bool:
+    async def _pipe_pane(self, agent: str, command: str | None = None) -> bool:
         """Run `pipe-pane`, tolerating a dead pane.
 
         A pane that has exited holds no pipe and cannot be given one; tmux
-        answers "target pane has exited". That is the ordinary state of a slot
-        being reused, not an error, so this returns False and lets `spawn`
-        attach the pipe after the respawn instead.
+        answers "target pane has exited". That is the ordinary state of a
+        window being reused for a retry, not an error, so this returns False
+        and lets `spawn` attach the pipe after the respawn instead.
         """
-        args = ["pipe-pane", "-t", self.target(slot)]
+        args = ["pipe-pane", "-t", self.target(agent)]
         if command is not None:
             args.append(command)
         code, out, err = await self._call(*args)
@@ -238,11 +238,19 @@ class TmuxRunner:
             return False
         raise TmuxError(f"tmux {' '.join(args)} failed ({code}): {err.strip() or out.strip()}")
 
-    async def close_pipe(self, slot: str) -> bool:
-        """`pipe-pane` with no command closes the pipe."""
-        return await self._pipe_pane(slot)
+    async def close_pipe(self, agent: str) -> bool:
+        """`pipe-pane` with no command closes the pipe.
 
-    async def open_pipe(self, slot: str, log_path: Path) -> bool:
+        A window that is gone has no pipe to close - and when it was the
+        session's last, tmux ended the session and the server with it, so
+        there is nothing to even ask. Finalizing an agent from its log after
+        its window vanished went exactly that way.
+        """
+        if not await self.window_exists(agent):
+            return False
+        return await self._pipe_pane(agent)
+
+    async def open_pipe(self, agent: str, log_path: Path) -> bool:
         """Append-only, unbounded by scrollback, ANSI preserved - and
         capped, by `logpipe.py`, which rotates without losing a byte."""
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -250,59 +258,55 @@ class TmuxRunner:
             shlex.quote(part)
             for part in (sys.executable, "-I", str(LOGPIPE), str(log_path), str(self.max_log_bytes))
         )
-        return await self._pipe_pane(slot, command)
+        return await self._pipe_pane(agent, command)
 
-    async def default_shell(self) -> str:
-        """tmux's `default-shell`. What an idle slot runs after a kill."""
-        code, out, _ = await self._call("show-options", "-gv", "default-shell")
-        return out.strip() if code == 0 and out.strip() else "/bin/sh"
-
-    async def is_piped(self, slot: str) -> bool:
-        return (await self.status(slot)).piped
+    async def is_piped(self, agent: str) -> bool:
+        return (await self.status(agent)).piped
 
     # -- the task lifecycle ----------------------------------------
 
-    async def spawn(self, slot: str, run: TaskRun, script: Path) -> None:
-        """Start a task in a slot.
+    async def spawn(self, agent: str, run: TaskRun, script: Path) -> None:
+        """Start a task in its agent's window, creating the window if needed.
 
         `script` is the generated wrapper. It is passed in rather than
         derived, because where it lives is layout knowledge that belongs to
         `config.Paths`, not to the module that knows tmux.
         """
-        # Both pipe calls are no-ops when the slot's previous pane is dead,
-        # which is the ordinary case for a reused slot.
-        await self.close_pipe(slot)
-        await self.open_pipe(slot, run.log_path)
+        await self.open_window(agent)
+        # Both pipe calls are no-ops when the window's previous pane is dead,
+        # which is the ordinary case for a window left by an earlier attempt.
+        await self.close_pipe(agent)
+        await self.open_pipe(agent, run.log_path)
         await self._tmux(
             "respawn-window",
             "-k",
             "-t",
-            self.target(slot),
+            self.target(agent),
             f"bash {shlex.quote(str(script))}",
         )
         # Re-opened, because of what `#{pane_pipe}` can actually tell
-        # us: it reports that *a* pipe exists, never where it points. A slot
+        # us: it reports that *a* pipe exists, never where it points. A window
         # being reused still carries the previous attempt's pipe, so checking
         # the flag and stopping there would append attempt N's output to
         # attempt N-1's log. `pipe-pane` with a command closes any existing
         # pipe and opens the new one, so re-opening unconditionally is both
         # the fix for a dropped pipe and the fix for a stale one. run.sh's
         # 250ms sleep is what makes this window harmless.
-        await self.open_pipe(slot, run.log_path)
-        if not await self.is_piped(slot):
-            raise TmuxError(f"could not attach the log pipe for {slot} -> {run.log_path}")
+        await self.open_pipe(agent, run.log_path)
+        if not await self.is_piped(agent):
+            raise TmuxError(f"could not attach the log pipe for {agent} -> {run.log_path}")
 
     async def panes(self) -> dict[str, PaneStatus]:
-        """Every slot's pane state in one tmux call, keyed by window name.
+        """Every agent's pane state in one tmux call, keyed by window name.
 
         `display -p -t <session>:<window>` cannot be used for this. When the
         window does not resolve, tmux does not fail: it silently answers for
-        the session's *current* window. That would report a live pane for a
-        slot whose window is gone, which is precisely the case restart
+        the session's *current* window. That would report a live pane for an
+        agent whose window is gone, which is precisely the case restart
         reconciliation has to detect. Enumerating panes and matching
         the name exactly is the only reliable answer.
 
-        One call for all seven slots is also what the manager's 1s tick wants.
+        One call for every agent is also what the manager's 1s tick wants.
         """
         if not await self.session_exists():
             return {}
@@ -338,40 +342,28 @@ class TmuxRunner:
             )
         return found
 
-    async def status(self, slot: str) -> PaneStatus:
+    async def status(self, agent: str) -> PaneStatus:
         """The completion signal. Never scrapes text."""
-        return (await self.panes()).get(slot, PaneStatus(exists=False))
+        return (await self.panes()).get(agent, PaneStatus(exists=False))
 
-    async def capture(self, slot: str, lines: int = 60) -> str:
+    async def capture(self, agent: str, lines: int = 60) -> str:
         """What is on screen right now. Previews only: never completion
         detection, never the log."""
         code, out, _ = await self._call(
-            "capture-pane", "-e", "-p", "-t", self.target(slot), "-S", f"-{lines}"
+            "capture-pane", "-e", "-p", "-t", self.target(agent), "-S", f"-{lines}"
         )
         return out if code == 0 else ""
 
-    async def kill(self, slot: str) -> None:
-        """Terminate the task and return the slot to an idle shell.
+    async def kill(self, agent: str) -> None:
+        """Terminate the task and remove its window.
 
         The whole process tree goes, so a dev server or watcher the harness
         started does not outlive the task.
         """
-        status = await self.status(slot)
+        status = await self.status(agent)
         if status.pid and not status.dead:
             await kill_process_tree(status.pid, grace=KILL_GRACE_SECONDS)
-        await self.close_pipe(slot)
-        # The shell is named explicitly: `respawn-window` with no command
-        # re-runs the *previous* command, which would restart the task that
-        # was just killed, or immediately re-exit if it had already finished.
-        await self._tmux(
-            "respawn-window", "-k", "-t", self.target(slot), await self.default_shell()
-        )
-        # A pipe survives a respawn, and the close above is a no-op when the
-        # pane died under the kill. Close it here, where the pane is
-        # guaranteed live, so the idle slot cannot append its shell noise to
-        # the finished task's log.
-        if await self.is_piped(slot):
-            await self.close_pipe(slot)
+        await self.close_window(agent)
 
 
 # --------------------------------------------------------------------------

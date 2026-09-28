@@ -23,7 +23,7 @@ The suite drives **real** tmux, real git, real SQLite, a real HTTP server and re
 Hand-written fakes stand in where an external service would cost money or reach off the machine; `unittest.mock` is not used.
 
 That is deliberate.
-Nearly every serious bug found in this project lived in a **seam** - between an LLM's output and a shell, between one slot's failure and six others, between a kill and a database write, between a key in a keychain and a client that only read the environment.
+Nearly every serious bug found in this project lived in a **seam** - between an LLM's output and a shell, between one agent's failure and every other, between a kill and a database write, between a key in a keychain and a client that only read the environment.
 Mock-heavy tests pass straight through seams.
 
 | File | Covers | Drives |

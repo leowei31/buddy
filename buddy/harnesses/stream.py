@@ -15,7 +15,7 @@ from typing import Any
 
 from buddy.logs import strip_ansi
 
-#: How wide one described line may be on a slot card.
+#: How wide one described line may be on an agent card.
 WIDTH = 90
 
 

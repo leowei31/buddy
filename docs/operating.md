@@ -9,7 +9,7 @@ Day to day: what the commands do, what the screen is telling you, and what to do
 `buddy` with no arguments is the interactive session.
 It reconciles whatever was left over, starts the dashboard, connects to your brain provider, and gives you a prompt.
 
-Underneath, a tick runs once a second: it notices panes that have died, finalizes those runs, checks the health of the rest, and fills free slots from the queue.
+Underneath, a tick runs once a second: it notices panes that have died, finalizes those runs, checks the health of the rest, and starts whatever in the queue is ready.
 
 **Leaving the session does not stop your agents.**
 They are in tmux, which is the entire point of putting them there.
@@ -21,10 +21,10 @@ They are in tmux, which is the entire point of putting them there.
 
 | Command | What it does |
 |---|---|
-| `buddy status` | The seven slots sorted by priority, then the queue. Catches up on anything that finished while nothing was watching. |
-| `buddy watch <slot>` | Attach to one slot's tmux window, read-only. `Ctrl-b d` to detach. |
-| `buddy attach` | Attach to the whole session, read-only. `Ctrl-b w` switches windows. |
-| `buddy logs <slot\|task_id> [--follow] [--attempt N] [--lines N]` | Print the last 200 lines of a log, or `--follow` it as it grows - through a [rotation](#logs) too. `--attempt` picks an earlier attempt. |
+| `buddy status` | Every running agent, most urgent first, then the queue. Catches up on anything that finished while nothing was watching. |
+| `buddy watch <agent>` | Attach to that agent's tmux window, read-only. `Ctrl-b d` to detach. |
+| `buddy attach` | Attach to the whole session, read-only. `Ctrl-b w` switches between agents' windows. |
+| `buddy logs <agent\|task_id> [--follow] [--attempt N] [--lines N]` | Print the last 200 lines of a log, or `--follow` it as it grows - through a [rotation](#logs) too. An agent's name means its latest task; `--attempt` picks an earlier attempt. |
 | `buddy history [--project P] [--limit N]` | Recent tasks and how they ended. |
 | `buddy doctor` | Preflight: tmux, git, the database, projects, the brain provider, voice, each harness. |
 
@@ -32,13 +32,13 @@ They are in tmux, which is the entire point of putting them there.
 
 | Command | What it does |
 |---|---|
-| `buddy spawn <project> "<brief>"` | Queue a task without talking to the brain. Options: `--harness H`, `--model M` (the harness's own name for it), `--priority N`, `--title T`, `--after t-0141` (repeatable), `--merge-required` (dependents wait for the merge, not just done), `--wait` (block until it finishes). |
+| `buddy spawn <project> "<brief>"` | Queue a task without talking to the brain. Options: `--name N` (what to call its [agent](#agents); default: made from the title), `--harness H`, `--model M` (the harness's own name for it), `--priority N`, `--title T`, `--after t-0141` (repeatable), `--merge-required` (dependents wait for the merge, not just done), `--wait` (block until it finishes). |
 | `buddy reprioritize <task_id> <N>` | Reorder the queue. Not confirmed - it is reversible. |
-| `buddy kill <slot> [--yes]` | Stop an agent. Its work is checkpointed, the task is marked killed, and it does **not** come back. |
+| `buddy kill <agent> [--yes]` | Stop an agent. Its work is checkpointed, the task is marked killed, and it does **not** come back. |
 | `buddy diff <task_id> [--into BRANCH]` | What that task's branch changed. |
-| `buddy merge <task_id> [--into BRANCH] [--yes] [--force] [--allow-secret-patterns]` | `--no-ff` into your checkout. Refuses if you are on the wrong branch, have uncommitted changes, a [conflict fix](#when-a-merge-conflicts) is pending (`--force` overrides), or the branch adds a [secret](#secrets) (`--allow-secret-patterns` lets checked lookalikes through, never your own keys). A conflict is aborted and reported. |
+| `buddy merge <task_id> [--into BRANCH] [--yes] [--force] [--allow-secret-patterns]` | `--no-ff` into your checkout. Refuses while the task's agent is still running, have uncommitted changes, a [conflict fix](#when-a-merge-conflicts) is pending (`--force` overrides), or the branch adds a [secret](#secrets) (`--allow-secret-patterns` lets checked lookalikes through, never your own keys). A conflict is aborted and reported. |
 | `buddy resolve <task_id> [--harness H] [--wait]` | Spawn an agent to resolve that task's merge conflict. |
-| `buddy discard <task_id> [--yes]` | Remove the worktree. The branch is kept for [the grace period](#discarding). |
+| `buddy discard <task_id> [--yes]` | Remove the worktree. The branch is kept for [the grace period](#discarding). Refused while the task's agent is still running. |
 
 ### Memory
 
@@ -98,7 +98,7 @@ What Buddy is careful about, all found by running each CLI:
 **Codex** runs `exec` with its own sandbox bypassed.
 Inside `--sandbox workspace-write` a write outside the worktree is refused and the network is off, so `npm install`, a Go or Cargo build, or anything with a cache in your home directory fails one tool call at a time - inside a run that can still end "successfully".
 It reads `CODEX_API_KEY` and ignores `OPENAI_API_KEY`.
-When it cannot reach its API it retries forever; Buddy does not count those retry lines as progress, so the slot goes `stalled` after `stall_timeout` instead of looking busy for two hours.
+When it cannot reach its API it retries forever; Buddy does not count those retry lines as progress, so the agent goes `stalled` after `stall_timeout` instead of looking busy for two hours.
 
 **OpenCode** gets the brief as an argument, never on stdin: `opencode run < prompt.md` reaches the model and then never produces another byte or exits.
 It runs with `--auto`, because without it every permission request is *rejected* and the run still exits 0 with the work undone; Buddy reports any refused tool call as a failure rather than trusting that exit code.
@@ -106,25 +106,34 @@ Its model names are `provider/model`, and without any credentials it uses OpenCo
 
 **Antigravity** runs with `--print-timeout 24h`, because print mode otherwise gives up after five minutes and nothing in its headless documentation says so.
 The brief is attached to `-p` - it takes a value and does not read stdin - and `--disable-slash-commands` stops a brief that starts with `/` being run as a command.
-Signed out, it does not fail: it prints a sign-in URL and waits for a pasted code, which marks the slot `waiting_input`.
+Signed out, it does not fail: it prints a sign-in URL and waits for a pasted code, which marks the agent `waiting_input`.
 
-## Reading the slot table
+## Agents
 
-Seven named slots, Monday through Sunday.
-A name is a stable handle you can say out loud, never a priority rank.
+Every task runs as an **agent**: a tmux window of its own, named for the agent, made when the task starts and closed when it ends.
+There is no fixed number of them.
+Everything that is ready starts, unless you set [`max_concurrent`](configuration.md#buddy) to put a ceiling on it.
 
-| Status | Means | Slot reusable? |
-|---|---|---|
-| `idle` | Nothing assigned. | yes |
-| `running` | Working. | no |
-| `waiting_input` | The harness asked a question. Buddy **never answers for it** - `buddy watch <slot>` and answer yourself. | no |
-| `stalled` | No progress for `stall_timeout` - no output, or only a harness's retry chatter. Notified, never killed. | no |
-| `done` | Exit 0. The pane and log stay for inspection. | yes |
-| `error` | Non-zero exit. | yes |
-| `killed` | By you, or by an accepted preemption. | yes |
-| `interrupted` | Buddy or tmux died underneath it. Requeued automatically. | yes |
+### Naming them
+
+Name an agent when you create it - `buddy spawn webapp "..." --name scout`, or *"put an agent called scout on it"* - or leave it out, and Buddy names it from the task's title: `Add rate limiting to the API` becomes `add-rate-limiting`, and `add-rate-limiting-2` if that is taken.
+
+- A name is letters, digits, `-` and `_`, up to 32 characters, starting with a letter or a digit. Spaces become `-`, so a spoken *"code reviewer"* is `code-reviewer`.
+- Case does not matter when you use one: `buddy kill Scout` and `buddy kill scout` stop the same agent.
+- No two queued or running agents share a name. Once one finishes, its name is free again, and `buddy logs scout` shows the latest task that ran under it.
+- A name that looks like a task id, such as `t-0007`, is refused: `buddy logs t-0007` has to mean one thing.
+- A task keeps its agent's name through retries, preemption and restarts.
+
+### What they are doing
+
+| Status | Means |
+|---|---|
+| `running` | Working. |
+| `waiting_input` | The harness asked a question. Buddy **never answers for it** - `buddy watch <agent>` and answer yourself. |
+| `stalled` | No progress for `stall_timeout` - no output, or only a harness's retry chatter. Notified, never killed. |
 
 A task moves `queued → running → done | error | killed`, and then `merged` or `discarded` once you decide.
+Its agent exists only while it is `running`; how it ended is on the task, and its log stays.
 
 ## What happens when things end
 
@@ -132,7 +141,7 @@ Every attempt is checkpointed onto its branch before anything else happens, so n
 
 | Outcome | What follows |
 |---|---|
-| `done`, `error` | Recorded. The slot frees. |
+| `done`, `error` | Recorded. Its window closes and its name is free. |
 | `killed` | Recorded. **Not** requeued - kill means kill. |
 | `preempted`, `interrupted`, `timeout` | Checkpointed and requeued at the original priority, with a resume note, as the next attempt. |
 
@@ -140,18 +149,19 @@ A second timeout on the same task is an error rather than an endless requeue.
 
 ## Preemption
 
-When a queued task outranks a running one and there is no room for it, Buddy **proposes** and never acts:
+When a queued task outranks a running one and cannot start until something stops, Buddy **proposes** and never acts:
 
 ```
-Tuesday is on t-0004 (priority 4). t-0009 is priority 1.
-Preempt Tuesday? Its work is checkpointed and it goes back on the queue.
+limiter is on t-0004 (Add rate limiting, priority 4), which t-0009 (Fix the outage) outranks.
+  Preempt it? Its work is checkpointed and it goes back on the queue
 ```
 
-Accepting checkpoints the victim, keeps its worktree and branch, requeues it at its original priority, and starts the waiting task in the slot it freed.
+Accepting checkpoints the victim, keeps its worktree and branch, requeues it at its original priority under the same name, and starts the waiting task.
 
-"No room" means `max_concurrent`, not idle slots: with a limit of two, the other five slots sit idle and preemption still applies.
-And a stop is only proposed if it would actually let the task start.
-A project that is not a git repository runs one task at a time, so a task waiting on it can only start once *that* project's task stops - which is the only stop Buddy will propose for it.
+With no limit - the default - a ready task simply starts, so only two things can hold one back.
+One is `max_concurrent`, once you set it and it is reached.
+The other is a project that is not a git repository, which runs one agent at a time: a task waiting on it can only start once *that* project's agent stops, which is the only stop Buddy will propose for it.
+A stop is only ever proposed if it would actually let the task start.
 
 A proposal can go stale - the victim finishes before you answer.
 Accepting a stale one stops nothing, and says why.
@@ -272,9 +282,9 @@ buddy overlay --stop     # close it
 buddy overlay --status   # one line in the terminal instead
 ```
 
-It shows each busy slot, what it is doing right now, and a summary line - and turns amber the moment a slot needs you.
+It shows each running agent, what it is doing right now, and a summary line - and turns amber the moment an agent needs you, listing that one first.
 Drag it by its header; the `–` button folds it to a single line.
-It sizes itself to whatever it is showing.
+It sizes itself to whatever it is showing, and scrolls once there are more agents than fit.
 
 It needs the `overlay` extra (`uv sync --extra overlay`) and a session running with its dashboard, because it reads the same read-only API.
 Only one runs at a time, and a stale pid file from a crash or reboot is cleaned up rather than believed.
@@ -292,7 +302,7 @@ To bind it to a key, point a macOS Shortcut or an Automator quick action at `bud
 
 `http://127.0.0.1:4321`, read-only by design: opening, closing or refreshing the tab cannot affect a running task.
 
-- **Dashboard** - the seven cards with status, task, priority, age, time since last output, and a three-line tail of what the agent is doing; then the queue with dependency badges, then recent tasks.
+- **Dashboard** - a card for every running agent with its name, status, task, priority, age, time since last output, and a three-line tail of what it is doing; then the queue with dependency badges and each task's agent name, then recent tasks.
 - **Task** - the log in a terminal with its colours intact, the brief, the branch, a `diff --stat`, and the parsed result.
 - **Conversation** - the transcript, updating live.
 
@@ -343,7 +353,7 @@ Paste the key **once**. The prompt hides what you type, so a paste that seems no
 
 Your Claude Code subscription is *not* an API key. The brain calls the API directly and needs its own billing.
 
-### A slot says `running` but the task finished
+### An agent says `running` but the task finished
 
 Only a running session ticks.
 If you spawned tasks and then closed the session, nothing noticed the panes die.
@@ -381,15 +391,15 @@ Buddy asks each CLI whether it can reach its model before giving it work - `code
 
 Then `buddy setup --force harnesses`, or just spawn again: a failed check is re-run after fifteen seconds.
 
-### A Codex slot is `stalled` and its card says `retrying`
+### A Codex agent is `stalled` and its card says `retrying`
 
 Codex cannot reach its API and will retry forever.
-Check its login and your network; `buddy kill <slot>` stops it.
+Check its login and your network; `buddy kill <agent>` stops it.
 
-### An Antigravity slot is `waiting_input`
+### An Antigravity agent is `waiting_input`
 
 It is signed out and waiting for a code.
-`buddy watch <slot>` shows the URL - or kill it, run `agy` once to sign in, and spawn again.
+`buddy watch <agent>` shows the URL - or kill it, run `agy` once to sign in, and spawn again.
 
 ### Voice is slow
 
@@ -400,7 +410,7 @@ That is 4363 ms → 661 ms per utterance, measured, with no loss of accuracy on 
 ### A task is queued and never starts
 
 `buddy status` shows why.
-Usual causes: it waits on a dependency; its project is not a git repo and another task holds that project's exclusive slot; or all seven slots are busy and it does not outrank any of them.
+Usual causes: it waits on a dependency; its project is not a git repo and another of its agents is running; or `max_concurrent` is set, reached, and it does not outrank anything running.
 
 A dependency that ended in `error`, `killed` or `discarded` can never be satisfied - Buddy says so once, and the task needs reprioritizing or discarding.
 

@@ -193,31 +193,41 @@ a {
   text-align: center;
 }
 
-/* ------------------------------------------------------------ slot cards */
+/* ----------------------------------------------------------- agent cards */
 
-.slots {
+.agents {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(292px, 1fr));
-  /* Every card the same height, so a busy row and an idle row do not make
-     the grid look like two different grids. */
+  /* min(..., 100%): on a screen narrower than one card, one column that fits
+     rather than one card wider than the page. */
+  grid-template-columns: repeat(auto-fill, minmax(min(292px, 100%), 1fr));
+  /* Every card the same height, so a row of short tails and a row of long
+     ones do not make the grid look like two different grids. */
   grid-auto-rows: 1fr;
   gap: 12px;
 }
 
-.slot {
+.agents > .empty {
+  grid-column: 1 / -1;
+}
+
+.agent {
   position: relative;
   display: flex;
   flex-direction: column;
+  /* Content never sets a card's width: a long branch name made the whole
+     grid wider than a phone screen. */
+  min-width: 0;
   min-height: 148px;
   padding: 13px 15px 12px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
   background: var(--panel);
   overflow: hidden;
+  cursor: pointer;
   transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
 }
 
-.slot::before {
+.agent::before {
   content: "";
   position: absolute;
   inset: 0 0 auto 0;
@@ -226,21 +236,13 @@ a {
   opacity: 0.85;
 }
 
-.slot.linked {
-  cursor: pointer;
-}
-
-.slot.linked:hover {
+.agent:hover {
   border-color: var(--border);
   background: var(--panel-hi);
   transform: translateY(-1px);
 }
 
-.slot.idle {
-  background: #11151d;
-}
-
-.slot-head {
+.agent-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -248,14 +250,18 @@ a {
   margin-bottom: 9px;
 }
 
-.slot-name {
+.agent-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--mono);
   font-size: 13.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
 }
 
-.slot-title {
+.agent-title {
   margin-bottom: 3px;
   font-size: 13.5px;
   font-weight: 500;
@@ -267,7 +273,7 @@ a {
   -webkit-box-orient: vertical;
 }
 
-.slot-sub {
+.agent-sub {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -276,7 +282,7 @@ a {
   font-size: 11.5px;
 }
 
-.slot-tail {
+.agent-tail {
   margin-top: auto;
   padding-top: 10px;
   color: var(--dim);
@@ -292,7 +298,7 @@ a {
   overflow: hidden;
 }
 
-.slot-foot {
+.agent-foot {
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -304,18 +310,25 @@ a {
   font-size: 11px;
 }
 
-.branch {
-  display: block;
+/* The agent's name on a task row: the handle it is known by. */
+.agent-tag {
+  min-width: 0;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text);
 }
 
-.slot-empty {
-  margin: auto 0;
-  color: var(--dim);
-  font-size: 12.5px;
+.branch {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ----------------------------------------------------------------- chips */
@@ -621,6 +634,27 @@ pre.block.scroll {
 @media (max-width: 900px) {
   .cols {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 560px) {
+  .topbar {
+    gap: 12px;
+    padding: 0 14px;
+  }
+  /* The one thing in the bar that says nothing new: every page is read-only. */
+  .readonly {
+    display: none;
+  }
+  .view {
+    padding: 18px 14px 48px;
+  }
+  .row {
+    grid-template-columns: 76px minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+  .row-pos {
+    display: none;
   }
 }
 

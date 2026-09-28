@@ -52,7 +52,7 @@ def run_in(worktree: Path) -> TaskRun:
     return TaskRun(
         task_id="t-0001",
         attempt=1,
-        slot="Monday",
+        agent="scout",
         worktree=worktree,
         branch="buddy/t-0001-x",
         base_ref="",
@@ -236,7 +236,7 @@ def test_antigravity_reports_a_rejected_key_from_its_result_envelope():
 
 def test_antigravity_signed_out_is_waiting_for_a_person():
     """Signed out, `agy -p` does not fail: it prints a URL and waits for a
-    pasted code. The slot has to say it needs you."""
+    pasted code. The agent has to say it needs you."""
     text = log("antigravity_signed_out.txt")
     patterns = list(AntigravityAdapter.default_waiting_patterns)
     agy = adapter(AntigravityAdapter, waiting_patterns=patterns)

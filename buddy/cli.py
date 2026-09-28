@@ -36,11 +36,12 @@ from buddy.harnesses.base import HarnessError, PreflightReport
 from buddy.logs import read_tail
 from buddy.manager import AgentManager
 from buddy.models import (
-    SLOT_NAMES,
+    Agent,
+    AgentHealthChanged,
+    AgentNameError,
     BranchDeleted,
     PreemptionProposal,
     RunOutcome,
-    SlotHealthChanged,
     TaskBlocked,
     TaskFinished,
     TaskRequeued,
@@ -151,7 +152,7 @@ async def _start_control(runtime: Runtime):
     from buddy.control import ControlServer
 
     def busy() -> dict:
-        return {"slots": len([s for s in runtime.manager.slots() if s.status.is_occupied])}
+        return {"agents": len(runtime.manager.agents())}
 
     server = ControlServer(runtime.config.home, on_status=busy)
     try:
@@ -453,7 +454,7 @@ async def _tick_forever(runtime: Runtime, *, lead: str = "") -> None:
 
 
 async def _watch_loop(runtime: Runtime) -> None:
-    console.print("Watching 7 slots. Ctrl-C to stop; tasks keep running in tmux.")
+    console.print("Watching every agent. Ctrl-C to stop; tasks keep running in tmux.")
     try:
         await _tick_forever(runtime)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -476,7 +477,6 @@ class Runtime:
             raise typer.Exit(2) from exc
         self.config.paths.ensure()
         self.store = Store(self.config.paths.db)
-        self.store.ensure_slots()
         #: Feeds the dashboard's websockets. Publishing with no subscribers
         #: costs nothing, so this is wired up whether or not the web server
         #: is running.
@@ -558,6 +558,14 @@ class Runtime:
         task = self.store.get_task(task_id)
         if task is None:
             console.print(f"[red]no such task:[/] {task_id}")
+            raise typer.Exit(2)
+        return task
+
+    def named_task_or_exit(self, target: str) -> TaskSpec:
+        """A task by id, or by its agent's name - the latest task under it."""
+        task = self.store.find_task(target)
+        if task is None:
+            console.print(f"[red]no such task or agent:[/] {escape(target)}")
             raise typer.Exit(2)
         return task
 
@@ -776,6 +784,13 @@ def spawn(
     project: str,
     brief: str,
     title: str = typer.Option("", "--title", help="Human label; defaults to the first line."),
+    name: str = typer.Option(
+        "",
+        "--name",
+        "-N",
+        help="What to call its agent. Default: made from the title.",
+        show_default=False,
+    ),
     harness: str = typer.Option(
         "",
         "--harness",
@@ -798,9 +813,20 @@ def spawn(
     ),
     wait: bool = typer.Option(False, "--wait", help="Block until the task finishes."),
 ) -> None:
-    """Queue a brief. The scheduler places it."""
+    """Queue a brief under a named agent. The scheduler starts it."""
     asyncio.run(
-        _spawn(project, brief, title, harness, priority, model, list(after), merge_required, wait)
+        _spawn(
+            project,
+            brief,
+            title,
+            harness,
+            priority,
+            model,
+            list(after),
+            merge_required,
+            wait,
+            name=name,
+        )
     )
 
 
@@ -814,6 +840,8 @@ async def _spawn(
     after: list[str],
     merge_required: bool,
     wait: bool,
+    *,
+    name: str = "",
 ) -> None:
     runtime = Runtime()
     config = runtime.config
@@ -849,18 +877,19 @@ async def _spawn(
         merge_required=merge_required,
         max_runtime=config.buddy.max_runtime,
         stall_timeout=config.buddy.stall_timeout,
+        agent=name,
     )
 
     try:
         events = await runtime.manager.submit(task)
-    except WorkspaceError as exc:
+    except (WorkspaceError, AgentNameError) as exc:
         fail(str(exc))
     except TmuxError as exc:
         # The task is already saved as queued; only starting it failed. It
         # starts on the next tick that can reach tmux - which is worth saying
         # plainly instead of as a traceback.
         fail(
-            f"{task.id} is queued, but tmux would not start it: {exc}. "
+            f"{task.id} ({task.agent}) is queued, but tmux would not start it: {exc}. "
             "It starts once tmux works - `buddy doctor` checks it."
         )
 
@@ -869,13 +898,14 @@ async def _spawn(
         event for event in events if isinstance(event, TaskStarted) and event.task_id == task.id
     ]
     if started:
-        slot = started[0].slot
-        console.print(f"  watch:  buddy watch {slot}\n  logs:   buddy logs {task.id} -f")
+        agent = started[0].agent
+        console.print(f"  watch:  buddy watch {agent}\n  logs:   buddy logs {agent} -f")
     elif runtime.store.get_task_state(task.id) is TaskState.QUEUED:
         blocked = runtime.manager.dependency_block(task)
         ahead = runtime.manager.queue_position(task.id)
         console.print(
-            f"[yellow]{task.id} queued[/] " + (blocked if blocked else f"behind {ahead} task(s)")
+            f"[yellow]{task.agent} ({task.id}) queued[/] "
+            + (blocked if blocked else f"behind {ahead} task(s)")
         )
 
     if wait:
@@ -912,38 +942,44 @@ def _report_events(runtime: Runtime, events: list) -> None:
     for event in events:
         if isinstance(event, TaskStarted):
             console.print(
-                f"[green]{event.slot}[/] started [bold]{event.task_id}[/] (attempt {event.attempt})"
+                f"[green]{event.agent}[/] started on [bold]{event.task_id}[/]"
+                f" (attempt {event.attempt})"
             )
         elif isinstance(event, TaskFinished):
             colour = "green" if event.outcome is RunOutcome.DONE else "red"
-            # A task refused before it started never had a slot.
-            where = f" on {event.slot}" if event.slot else ""
+            who = f"{event.agent} ({event.task_id})" if event.agent else event.task_id
             console.print(
-                f"[{colour}]{event.task_id} {event.outcome.value}[/]{where}"
+                f"[{colour}]{who} {event.outcome.value}[/]"
                 + (f" (exit {event.exit_code})" if event.exit_code is not None else "")
             )
-            if event.summary:
+            if event.summary and event.summary != event.outcome.value:
                 # Agent output, verbatim: rich would read `[...]` in it as markup
                 # and silently drop it - Google's own error text lost half itself.
                 console.print(f"  {escape(event.summary)}")
+            # soft_wrap: a hard wrap lands inside the command, and what you
+            # copy is then not what Buddy said.
             if event.branch and event.outcome is RunOutcome.DONE:
-                console.print(f"  branch {event.branch} - `buddy diff {event.task_id}` to review")
+                console.print(
+                    f"  branch {event.branch} - `buddy diff {event.task_id}` to review",
+                    soft_wrap=True,
+                )
             elif event.branch:
                 console.print(
                     f"  branch {event.branch} keeps anything it got done - "
-                    f"`buddy diff {event.task_id}` shows what, if anything"
+                    f"`buddy diff {event.task_id}` shows what, if anything",
+                    soft_wrap=True,
                 )
         elif isinstance(event, TaskRequeued):
             console.print(
                 f"[yellow]{event.task_id} {event.reason.value}[/]; "
                 f"requeued as attempt {event.next_attempt}, nothing lost"
             )
-        elif isinstance(event, SlotHealthChanged):
+        elif isinstance(event, AgentHealthChanged):
             colour = {"waiting_input": "yellow", "stalled": "yellow"}.get(
                 event.status.value, "green"
             )
             console.print(
-                f"[{colour}]{event.slot} is {event.status.value}[/]"
+                f"[{colour}]{event.agent} is {event.status.value}[/]"
                 + (f": {escape(event.detail)}" if event.detail else "")
             )
         elif isinstance(event, BranchDeleted):
@@ -962,7 +998,7 @@ def _offer_preemption(runtime: Runtime, proposal: PreemptionProposal) -> None:
     victim = runtime.store.get_task(proposal.victim_task_id)
     incoming = runtime.store.get_task(proposal.incoming_task_id)
     console.print(
-        f"[yellow]{proposal.victim_slot}[/] is on {proposal.victim_task_id}"
+        f"[yellow]{proposal.victim_agent}[/] is on {proposal.victim_task_id}"
         f" ({victim.title if victim else '?'}, priority {victim.priority if victim else '?'}),"
         f" which {proposal.incoming_task_id}"
         f" ({incoming.title if incoming else '?'}) outranks."
@@ -1000,9 +1036,9 @@ async def _tick_until_done(runtime: Runtime, task_id: str) -> None:
             await asyncio.sleep(1)
 
 
-@app.command(help="The seven slots, most urgent first, then the queue.")
+@app.command(help="Every running agent, most urgent first, then the queue.")
 def status() -> None:
-    """Slots sorted by priority, then the queue."""
+    """Running agents sorted by priority, then the queue."""
     asyncio.run(_status())
 
 
@@ -1015,17 +1051,13 @@ async def _status() -> None:
     await _catch_up(runtime)
     panes = await runtime.runner.panes()
     table = Table(show_header=True, header_style="bold")
-    for column in ("slot", "status", "task", "harness", "pri", "age", "pane"):
+    for column in ("agent", "status", "task", "harness", "pri", "age", "pane"):
         table.add_column(column)
 
-    # Displayed by priority, but a slot with no task falls back
-    # to week order rather than alphabetical: the name is a handle the user
-    # says out loud, so a stable, expected order matters.
-    week = {name: index for index, name in enumerate(SLOT_NAMES)}
-    slots = runtime.store.load_slots()
-    slots.sort(key=lambda s: (s.priority is None, s.priority or 0, week.get(s.name, 99)))
-    for slot in slots:
-        pane = panes.get(slot.name)
+    # Most urgent first, then oldest first, which is how the store keeps them.
+    agents = runtime.store.load_agents()
+    for agent in agents:
+        pane = panes.get(agent.name)
         if pane is None:
             pane_text = "[red]missing[/]"
         elif pane.dead:
@@ -1033,52 +1065,68 @@ async def _status() -> None:
         else:
             pane_text = "alive"
         age = ""
-        if slot.started_at:
-            age = f"{int((utcnow() - slot.started_at).total_seconds() // 60)}m"
+        if agent.started_at:
+            age = f"{int((utcnow() - agent.started_at).total_seconds() // 60)}m"
         table.add_row(
-            slot.name,
-            slot.status.value,
-            slot.task_id or "",
-            slot.harness or "",
-            str(slot.priority or ""),
+            escape(agent.name),
+            agent.status.value,
+            agent.task_id,
+            agent.harness or "",
+            str(agent.priority or ""),
             age,
             pane_text,
         )
-    console.print(table)
+    if agents:
+        console.print(table)
+    else:
+        console.print("No agents running.")
 
     queued = runtime.store.tasks_in_state(TaskState.QUEUED)
     if queued:
         console.print(f"\n[bold]Queue[/] ({len(queued)})")
         for task in queued:
             waits = f" waits for {', '.join(task.depends_on)}" if task.depends_on else ""
-            console.print(f"  {task.id}  p{task.priority}  {escape(task.title)}{waits}")
+            console.print(
+                f"  {task.id}  {escape(task.agent)}  p{task.priority}  {escape(task.title)}{waits}"
+            )
 
 
-@app.command(help="Stop a running task. Its work is checkpointed; it is not retried.")
+@app.command(help="Stop a running agent. Its work is checkpointed; it is not retried.")
 def kill(
-    slot: str,
+    agent: str,
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
 ) -> None:
-    """Kill a running task. Always confirmed: it is mid-work."""
-    asyncio.run(_kill(slot, yes))
+    """Kill a running agent. Always confirmed: it is mid-work."""
+    asyncio.run(_kill(agent, yes))
 
 
-async def _kill(slot_name: str, yes: bool) -> None:
+def _running_agent(runtime: Runtime, name: str) -> Agent:
+    """The running agent called `name`, or exit saying who is running."""
+    agent = runtime.store.get_agent(name)
+    if agent is not None:
+        return agent
+    running = ", ".join(a.name for a in runtime.store.load_agents()) or "none"
+    ended = runtime.store.task_for_agent(name)
+    if ended is not None:
+        state = runtime.store.get_task_state(ended.id)
+        fail(
+            f"{name} is not running ({ended.id} is {state.value if state else '?'}); "
+            f"`buddy logs {name}` shows its output. Running now: {running}"
+        )
+    fail(f"no agent is called {name}. Running now: {running}")
+
+
+async def _kill(name: str, yes: bool) -> None:
     runtime = Runtime()
-    if slot_name not in SLOT_NAMES:
-        fail(f"no such slot: {slot_name} (slots are Monday..Sunday)")
-    slot = runtime.manager._slot(slot_name)
-    if not slot.task_id:
-        console.print(f"{slot_name} is {slot.status.value}; nothing to kill.")
-        raise typer.Exit
-    task = runtime.store.get_task(slot.task_id)
+    agent = _running_agent(runtime, name)
+    task = runtime.store.get_task(agent.task_id)
     if not yes and not typer.confirm(
-        f"Kill {slot.task_id} ({task.title if task else '?'}) on {slot_name}? "
+        f"Kill {agent.name} ({agent.task_id}: {task.title if task else '?'})? "
         "Its work is checkpointed but the task is not retried"
     ):
         console.print("Left running.")
         raise typer.Exit
-    _report_events(runtime, await runtime.manager.kill_agent(slot_name))
+    _report_events(runtime, await runtime.manager.kill_agent(agent.name))
 
 
 @app.command(help="Change a task's priority: 1 is urgent, 5 is whenever.")
@@ -1268,13 +1316,16 @@ def _exec_tmux(*args: str) -> None:
     os.execvp(tmux, [tmux, *args])  # noqa: S606 - handing the terminal to tmux is the point
 
 
-@app.command(help="Attach to one slot's terminal, read-only. Ctrl-b d detaches.")
-def watch(slot: str) -> None:
-    """Attach to one slot, read-only."""
-    _exec_tmux("attach", "-t", f"{TmuxRunner.SESSION}:={slot}", "-r")
+@app.command(help="Attach to one agent's terminal, read-only. Ctrl-b d detaches.")
+def watch(agent: str) -> None:
+    """Attach to one agent's window, read-only."""
+    runtime = Runtime()
+    name = _running_agent(runtime, agent).name
+    runtime.store.close()
+    _exec_tmux("attach", "-t", f"{TmuxRunner.SESSION}:={name}", "-r")
 
 
-@app.command(help="Attach to all seven slots, read-only. Ctrl-b w switches windows.")
+@app.command(help="Attach to every agent's window, read-only. Ctrl-b w switches windows.")
 def attach() -> None:
     """Attach to the session, read-only. Ctrl-b w switches windows."""
     _exec_tmux("attach", "-t", f"={TmuxRunner.SESSION}", "-r")
@@ -1289,16 +1340,10 @@ def logs(
     ),
     lines: int = typer.Option(200, "-n", "--lines", help="How many lines from the end."),
 ) -> None:
-    """Print or tail a task's log without attaching."""
+    """Print or tail a task's log without attaching. `target` is an agent's
+    name or a task id; a name that has been reused means its latest task."""
     runtime = Runtime()
-    task_id = target
-    if target not in {slot.name for slot in runtime.store.load_slots()}:
-        runtime.task_or_exit(target)
-    else:
-        slot = {s.name: s for s in runtime.store.load_slots()}[target]
-        if not slot.task_id:
-            fail(f"{target} is idle")
-        task_id = slot.task_id
+    task_id = runtime.named_task_or_exit(target).id
 
     run = runtime.store.get_run(task_id, attempt) if attempt else runtime.store.latest_run(task_id)
     if run is None:
@@ -1803,11 +1848,11 @@ async def _shutdown(*, yes: bool, keep_worktrees: bool) -> int:
     # finalized rather than stopped as though it were still running.
     await _catch_up(runtime)
 
-    running = [slot for slot in runtime.manager.slots() if slot.status.is_occupied]
+    running = runtime.manager.agents()
     if running:
         console.print(f"[yellow]{len(running)} agent(s) still running:[/]")
-        for slot in running:
-            console.print(f"  {slot.name}: {slot.task_id}")
+        for agent in running:
+            console.print(f"  {escape(agent.name)}: {agent.task_id}")
         console.print(
             "[dim]They will be checkpointed onto their branches and requeued, so they "
             "pick up where they left off next time. Nothing is lost.[/]"

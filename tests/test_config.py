@@ -61,7 +61,7 @@ def config(tmp_path: Path) -> Config:
 
 def test_missing_config_file_yields_defaults(tmp_path: Path):
     cfg = Config.load(home=tmp_path)
-    assert cfg.buddy.max_concurrent == 7
+    assert cfg.buddy.max_concurrent == 0, "no limit on agents unless one is set"
     assert cfg.buddy.stall_timeout == timedelta(minutes=10)
     assert cfg.brain.provider == "anthropic"
     assert cfg.projects == {}
@@ -174,3 +174,9 @@ def test_a_keychain_reference_in_harness_env_is_still_fine(tmp_path):
     )
     config = Config.load(home=tmp_path)
     assert config.harness("codex").env["CODEX_API_KEY"] == "${keychain:OPENAI_API_KEY}"
+
+
+def test_a_negative_limit_on_agents_is_refused(tmp_path: Path):
+    (tmp_path / "config.toml").write_text("[buddy]\nmax_concurrent = -1\n")
+    with pytest.raises(ConfigError, match="buddy.max_concurrent: -1 is less than 0"):
+        Config.load(home=tmp_path)

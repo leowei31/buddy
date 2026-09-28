@@ -17,10 +17,11 @@ from buddy.config import Config
 from buddy.harnesses.claude_code import ClaudeCodeAdapter
 from buddy.manager import AgentManager
 from buddy.models import (
+    AgentHealthChanged,
+    AgentNameError,
+    AgentStatus,
     PreemptionProposal,
     RunOutcome,
-    SlotHealthChanged,
-    SlotStatus,
     TaskBlocked,
     TaskFinished,
     TaskRequeued,
@@ -37,49 +38,54 @@ from buddy.workspace import Checkout, WorkspaceError
 
 
 class FakeRunner:
-    """Stands in for tmux: pane state is set by the test, not by a process."""
+    """Stands in for tmux: pane state is set by the test, not by a process.
+
+    One window per agent, as in tmux: made when it spawns, gone when it is
+    killed or closed.
+    """
 
     def __init__(self) -> None:
         self.panes_state: dict[str, PaneStatus] = {}
         self.spawned: list[tuple[str, str, int]] = []
         self.killed: list[str] = []
+        self.closed: list[str] = []
         self.pipes_opened: list[str] = []
-        self.sessions_ensured = 0
-
-    async def ensure_session(self, slots=None) -> None:
-        self.sessions_ensured += 1
 
     async def panes(self) -> dict[str, PaneStatus]:
         return dict(self.panes_state)
 
-    async def status(self, slot: str) -> PaneStatus:
-        return self.panes_state.get(slot, PaneStatus(exists=False))
+    async def status(self, agent: str) -> PaneStatus:
+        return self.panes_state.get(agent, PaneStatus(exists=False))
 
-    async def spawn(self, slot: str, run, script: Path) -> None:
-        self.spawned.append((slot, run.task_id, run.attempt))
-        self.panes_state[slot] = PaneStatus(exists=True, dead=False, pid=1234, piped=True)
+    async def spawn(self, agent: str, run, script: Path) -> None:
+        self.spawned.append((agent, run.task_id, run.attempt))
+        self.panes_state[agent] = PaneStatus(exists=True, dead=False, pid=1234, piped=True)
         run.log_path.parent.mkdir(parents=True, exist_ok=True)
         run.log_path.touch()
 
-    async def kill(self, slot: str) -> None:
-        self.killed.append(slot)
-        self.panes_state[slot] = PaneStatus(exists=True, dead=False, pid=1, piped=False)
+    async def kill(self, agent: str) -> None:
+        self.killed.append(agent)
+        self.panes_state.pop(agent, None)
 
-    async def close_pipe(self, slot: str) -> bool:
+    async def close_window(self, agent: str) -> None:
+        if self.panes_state.pop(agent, None) is not None:
+            self.closed.append(agent)
+
+    async def close_pipe(self, agent: str) -> bool:
         return True
 
-    async def open_pipe(self, slot: str, log_path: Path) -> bool:
-        self.pipes_opened.append(slot)
+    async def open_pipe(self, agent: str, log_path: Path) -> bool:
+        self.pipes_opened.append(agent)
         return True
 
-    def finish(self, slot: str, exit_code: int = 0) -> None:
+    def finish(self, agent: str, exit_code: int = 0) -> None:
         """The pane exits: the completion signal."""
-        self.panes_state[slot] = PaneStatus(
+        self.panes_state[agent] = PaneStatus(
             exists=True, dead=True, exit_code=exit_code, pid=1234, piped=True
         )
 
-    def lose_window(self, slot: str) -> None:
-        self.panes_state.pop(slot, None)
+    def lose_window(self, agent: str) -> None:
+        self.panes_state.pop(agent, None)
 
 
 class FakeWorkspace:
@@ -93,7 +99,7 @@ class FakeWorkspace:
         self.prune_explodes: set[str] = set()
         self.worktree_prunes: list[str] = []
 
-    async def requires_exclusive_slot(self, project: str) -> bool:
+    async def requires_exclusive_run(self, project: str) -> bool:
         return project in self.non_git
 
     async def create(self, task: TaskSpec) -> Checkout:
@@ -153,7 +159,6 @@ def config(tmp_path: Path) -> Config:
 @pytest.fixture
 def store(config: Config) -> Store:
     with Store(config.paths.db) as s:
-        s.ensure_slots()
         yield s
 
 
@@ -182,6 +187,29 @@ def manager(config, store, runner, workspace, clock) -> AgentManager:
         adapter_for=lambda name: ClaudeCodeAdapter(config.harness(name)),
         now=clock,
     )
+
+
+def limited_manager(tmp_path, store, runner, workspace, clock, limit: int) -> AgentManager:
+    """A manager under `max_concurrent = limit`."""
+    (tmp_path / "config.toml").write_text(
+        (tmp_path / "config.toml").read_text() + f"\n[buddy]\nmax_concurrent = {limit}\n"
+    )
+    limited = Config.load(home=tmp_path)
+    return AgentManager(
+        limited,
+        store,
+        runner,
+        workspace,
+        adapter_for=lambda n: ClaudeCodeAdapter(limited.harness(n)),
+        now=clock,
+    )
+
+
+@pytest.fixture
+def capped(tmp_path, store, runner, workspace, clock) -> AgentManager:
+    """Seven at a time. Preemption only exists where there is a limit: with
+    none, anything ready simply starts."""
+    return limited_manager(tmp_path, store, runner, workspace, clock, 7)
 
 
 #: Ids handed out this test. `next_task_id` only sees *persisted* tasks, and
@@ -223,15 +251,16 @@ def kinds(events, kind) -> list:
 # -- scheduling -----------------------------------------------------
 
 
-async def test_submitting_a_task_starts_it_in_a_slot(manager, store, runner):
-    task = make_task(store)
+async def test_submitting_a_task_starts_it_under_its_agents_name(manager, store, runner):
+    task = make_task(store, agent="scout")
     events = await manager.submit(task)
 
     started = kinds(events, TaskStarted)
     assert len(started) == 1
-    assert started[0].slot == "Monday"
-    assert runner.spawned == [("Monday", task.id, 1)]
+    assert started[0].agent == "scout"
+    assert runner.spawned == [("scout", task.id, 1)]
     assert store.get_task_state(task.id) is TaskState.RUNNING
+    assert store.get_agent("scout").task_id == task.id
 
 
 async def test_a_task_whose_harness_cannot_be_built_fails_alone(
@@ -241,7 +270,7 @@ async def test_a_task_whose_harness_cannot_be_built_fails_alone(
 
     Reproduced from the session: the brain names a harness freely, and the
     CLI's adapter lookup raised out of `schedule()`, which sits outside the
-    per-slot isolation - so every tick failed and nothing else ever started.
+    per-agent isolation - so every tick failed and nothing else ever started.
     """
     from buddy.harnesses.base import HarnessError
 
@@ -301,10 +330,34 @@ async def test_a_run_that_cannot_be_prepared_fails_alone(tmp_path, store, runner
     assert store.get_task_state(doomed.id) is TaskState.ERROR
 
 
-async def test_slots_fill_in_week_order_and_idle_ones_go_first(manager, store, runner):
+async def test_an_agent_nobody_named_is_named_from_its_title(manager, store, runner):
     for _ in range(3):
-        await manager.submit(make_task(store))
-    assert [slot for slot, _, _ in runner.spawned] == ["Monday", "Tuesday", "Wednesday"]
+        await manager.submit(make_task(store, title="Add rate limiting to the API"))
+    assert [agent for agent, _, _ in runner.spawned] == [
+        "add-rate-limiting",
+        "add-rate-limiting-2",
+        "add-rate-limiting-3",
+    ]
+
+
+async def test_a_name_is_checked_before_anything_is_saved(manager, store, runner):
+    await manager.submit(make_task(store, agent="scout"))
+
+    taken = make_task(store, agent="Scout")
+    with pytest.raises(AgentNameError, match="already"):
+        await manager.submit(taken)
+    with pytest.raises(AgentNameError, match="letters, digits"):
+        await manager.submit(make_task(store, agent="-rf"))
+
+    assert store.get_task(taken.id) is None
+    assert len(runner.spawned) == 1
+
+
+async def test_a_spoken_name_with_spaces_becomes_a_usable_one(manager, store, runner):
+    task = make_task(store, agent="code reviewer")
+    await manager.submit(task)
+    assert task.agent == "code-reviewer"
+    assert runner.spawned[0][0] == "code-reviewer"
 
 
 async def test_priority_order_then_fifo(manager, store, runner):
@@ -320,39 +373,33 @@ async def test_priority_order_then_fifo(manager, store, runner):
     assert titles == ["urgent", "middle", "whenever", "also whenever"]
 
 
-async def test_the_eighth_task_waits(manager, store, runner, config):
-    for _ in range(8):
+async def test_there_is_no_limit_unless_one_is_set(manager, store, runner):
+    for _ in range(12):
         await manager.submit(make_task(store))
-    assert len(runner.spawned) == 7
-    assert len(store.tasks_in_state(TaskState.QUEUED)) == 1
+    assert len(runner.spawned) == 12
+    assert store.tasks_in_state(TaskState.QUEUED) == []
+    assert manager.max_concurrent is None
 
 
-async def test_max_concurrent_is_honoured(config, store, runner, workspace, clock, tmp_path):
-    (tmp_path / "config.toml").write_text(
-        (tmp_path / "config.toml").read_text() + "\n[buddy]\nmax_concurrent = 2\n"
-    )
-    limited = Config.load(home=tmp_path)
-    manager = AgentManager(
-        limited,
-        store,
-        runner,
-        workspace,
-        adapter_for=lambda n: ClaudeCodeAdapter(limited.harness(n)),
-        now=clock,
-    )
+async def test_max_concurrent_is_honoured(store, runner, workspace, clock, tmp_path):
+    manager = limited_manager(tmp_path, store, runner, workspace, clock, 2)
     for _ in range(4):
         await manager.submit(make_task(store))
     assert len(runner.spawned) == 2
+    assert len(store.tasks_in_state(TaskState.QUEUED)) == 2
 
 
-async def test_a_finished_slot_is_reused_but_idle_slots_come_first(manager, store, runner):
-    first = make_task(store)
+async def test_a_finished_agent_is_retired_and_its_name_is_free(manager, store, runner):
+    first = make_task(store, agent="scout")
     await manager.submit(first)
-    runner.finish("Monday", 0)
+    runner.finish("scout", 0)
     await manager.tick()
 
-    await manager.submit(make_task(store))
-    assert runner.spawned[-1][0] == "Tuesday"  # Monday still shows its output
+    assert runner.closed == ["scout"], "its window goes when its attempt ends"
+    assert manager.agents() == []
+    again = make_task(store, agent="scout")
+    await manager.submit(again)
+    assert store.get_agent("scout").task_id == again.id
 
 
 # -- dependencies ---------------------------------------------------
@@ -367,7 +414,7 @@ async def test_a_dependent_task_waits_for_its_dependency(manager, store, runner)
     assert len(runner.spawned) == 1
     assert store.get_task_state(second.id) is TaskState.QUEUED
 
-    runner.finish("Monday", 0)
+    runner.finish(first.agent, 0)
     await manager.tick()
 
     assert len(runner.spawned) == 2
@@ -380,7 +427,7 @@ async def test_merge_required_makes_the_dependent_wait_for_the_merge(manager, st
     second = make_task(store, depends_on=[first.id])
     await manager.submit(first)
     await manager.submit(second)
-    runner.finish("Monday", 0)
+    runner.finish(first.agent, 0)
     await manager.tick()
 
     assert len(runner.spawned) == 1
@@ -396,7 +443,7 @@ async def test_a_failed_dependency_is_reported_once(manager, store, runner):
     second = make_task(store, depends_on=[first.id])
     await manager.submit(first)
     await manager.submit(second)
-    runner.finish("Monday", 1)
+    runner.finish(first.agent, 1)
 
     events = await manager.tick()
     blocked = kinds(events, TaskBlocked)
@@ -411,7 +458,7 @@ async def test_a_dependency_on_an_unknown_task_blocks(manager, store):
     assert "does not exist" in manager.dependency_block(task)
 
 
-# -- non-git projects take a slot exclusively ----------------------
+# -- non-git projects run one agent at a time -----------------------
 
 
 async def test_two_tasks_in_a_non_git_project_do_not_run_at_once(manager, store, runner, workspace):
@@ -422,7 +469,7 @@ async def test_two_tasks_in_a_non_git_project_do_not_run_at_once(manager, store,
     await manager.submit(second)
 
     assert len(runner.spawned) == 1
-    runner.finish("Monday", 0)
+    runner.finish(first.agent, 0)
     await manager.tick()
     assert len(runner.spawned) == 2
 
@@ -443,7 +490,7 @@ async def test_a_locked_project_does_not_block_other_work(manager, store, runner
 async def test_a_dead_pane_is_finalized_with_its_exit_code(manager, store, runner, config):
     task = make_task(store)
     await manager.submit(task)
-    runner.finish("Monday", 0)
+    runner.finish(task.agent, 0)
 
     events = await manager.tick()
 
@@ -458,7 +505,7 @@ async def test_a_dead_pane_is_finalized_with_its_exit_code(manager, store, runne
 async def test_a_nonzero_exit_is_an_error(manager, store, runner):
     task = make_task(store)
     await manager.submit(task)
-    runner.finish("Monday", 3)
+    runner.finish(task.agent, 3)
     events = await manager.tick()
     assert kinds(events, TaskFinished)[0].outcome is RunOutcome.ERROR
     assert store.get_task_state(task.id) is TaskState.ERROR
@@ -467,7 +514,7 @@ async def test_a_nonzero_exit_is_an_error(manager, store, runner):
 async def test_finishing_checkpoints_the_worktree(manager, store, runner, workspace):
     task = make_task(store)
     await manager.submit(task)
-    runner.finish("Monday", 0)
+    runner.finish(task.agent, 0)
     await manager.tick()
     assert workspace.checkpoints == [(task.id, 1, RunOutcome.DONE)]
 
@@ -491,8 +538,8 @@ async def test_a_prompt_that_slipped_past_auto_approve_becomes_waiting_input(
 
     events = await manager.tick()
 
-    health = kinds(events, SlotHealthChanged)[0]
-    assert health.status is SlotStatus.WAITING_INPUT
+    health = kinds(events, AgentHealthChanged)[0]
+    assert health.status is AgentStatus.WAITING_INPUT
     assert "attach" in health.detail
     assert runner.killed == []  # Buddy never answers for the harness
 
@@ -506,7 +553,7 @@ async def test_silence_becomes_stalled_but_nothing_is_killed(manager, store, run
     clock.advance(minutes=11)
     events = await manager.tick()
 
-    assert kinds(events, SlotHealthChanged)[0].status is SlotStatus.STALLED
+    assert kinds(events, AgentHealthChanged)[0].status is AgentStatus.STALLED
     assert runner.killed == []
     assert store.get_task_state(task.id) is TaskState.RUNNING
 
@@ -517,8 +564,8 @@ async def test_a_harness_retrying_forever_is_stalled_not_running(
     """Codex prints "Reconnecting... waiting for network" every few seconds
     when its API is unreachable, and never exits (measured, 0.154.0).
 
-    The log grows the whole time, so before `is_progress` the slot said
-    RUNNING until `max_runtime` - two hours of a slot doing nothing.
+    The log grows the whole time, so before `is_progress` the agent said
+    RUNNING until `max_runtime` - two hours of an agent doing nothing.
     """
     from buddy.harnesses.codex import CodexAdapter
 
@@ -551,14 +598,13 @@ async def test_a_harness_retrying_forever_is_stalled_not_running(
         events.extend(await manager.tick())
 
     # Health is reported on change, so exactly one transition, to STALLED.
-    assert [e.status for e in kinds(events, SlotHealthChanged)] == [SlotStatus.STALLED]
-    slot = next(s for s in store.load_slots() if s.name == runner.spawned[0][0])
-    assert "retrying" in slot.last_output
+    assert [e.status for e in kinds(events, AgentHealthChanged)] == [AgentStatus.STALLED]
+    assert "retrying" in store.get_agent(task.agent).last_output
 
     # A real step of work is progress again.
     log += '{"type":"item.started","item":{"type":"command_execution","command":"ls"}}\n'
     write_log(store, config, task.id, log)
-    assert kinds(await manager.tick(), SlotHealthChanged)[0].status is SlotStatus.RUNNING
+    assert kinds(await manager.tick(), AgentHealthChanged)[0].status is AgentStatus.RUNNING
 
 
 async def test_output_clears_a_stall(manager, store, runner, config, clock):
@@ -571,15 +617,15 @@ async def test_output_clears_a_stall(manager, store, runner, config, clock):
 
     write_log(store, config, task.id, "start\nmore output, it was just slow\n")
     events = await manager.tick()
-    assert kinds(events, SlotHealthChanged)[0].status is SlotStatus.RUNNING
+    assert kinds(events, AgentHealthChanged)[0].status is AgentStatus.RUNNING
 
 
 async def test_health_is_reported_on_change_not_every_tick(manager, store, runner, config, clock):
     task = make_task(store)
     await manager.submit(task)
     write_log(store, config, task.id, "(y/n)\n")
-    assert kinds(await manager.tick(), SlotHealthChanged)
-    assert not kinds(await manager.tick(), SlotHealthChanged)
+    assert kinds(await manager.tick(), AgentHealthChanged)
+    assert not kinds(await manager.tick(), AgentHealthChanged)
 
 
 async def test_a_timeout_is_killed_checkpointed_and_requeued_once(
@@ -594,10 +640,10 @@ async def test_a_timeout_is_killed_checkpointed_and_requeued_once(
     requeued = kinds(events, TaskRequeued)[0]
     assert requeued.reason is RunOutcome.TIMEOUT
     assert requeued.next_attempt == 2
-    assert "Monday" in runner.killed
+    assert task.agent in runner.killed
     assert workspace.checkpoints == [(task.id, 1, RunOutcome.TIMEOUT)]
-    # Requeued, and picked straight back up in the freed slot.
-    assert runner.spawned[-1] == ("Monday", task.id, 2)
+    # Requeued, and picked straight back up under the same name.
+    assert runner.spawned[-1] == (task.agent, task.id, 2)
     assert store.get_task(task.id).attempt == 2
 
 
@@ -633,59 +679,46 @@ async def test_a_retry_resumes_in_the_same_worktree_with_a_resume_note(
 # -- preemption -----------------------------------------------------
 
 
-async def fill_all_slots(manager, store, priority: int = 3) -> list[TaskSpec]:
-    tasks = [make_task(store, priority=priority) for _ in range(7)]
+async def fill(manager, store, priority: int = 3, count: int = 7) -> list[TaskSpec]:
+    tasks = [make_task(store, priority=priority) for _ in range(count)]
     for task in tasks:
         await manager.submit(task)
     return tasks
 
 
-async def test_an_urgent_task_proposes_a_preemption_but_never_takes_one(manager, store, runner):
-    await fill_all_slots(manager, store, priority=4)
+async def test_an_urgent_task_proposes_a_preemption_but_never_takes_one(capped, store, runner):
+    running = await fill(capped, store, priority=4)
     urgent = make_task(store, priority=1, title="urgent")
 
-    events = await manager.submit(urgent)
+    events = await capped.submit(urgent)
 
     proposals = kinds(events, PreemptionProposal)
     assert len(proposals) == 1
     assert proposals[0].incoming_task_id == urgent.id
-    assert proposals[0].victim_slot in {
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
-    }
+    assert proposals[0].victim_agent in {task.agent for task in running}
     # Proposed only: nothing was killed.
     assert runner.killed == []
     assert store.get_task_state(urgent.id) is TaskState.QUEUED
 
 
-def two_slot_manager(tmp_path, store, runner, workspace, clock) -> AgentManager:
-    (tmp_path / "config.toml").write_text(
-        (tmp_path / "config.toml").read_text() + "\n[buddy]\nmax_concurrent = 2\n"
-    )
-    limited = Config.load(home=tmp_path)
-    return AgentManager(
-        limited,
-        store,
-        runner,
-        workspace,
-        adapter_for=lambda n: ClaudeCodeAdapter(limited.harness(n)),
-        now=clock,
-    )
+async def test_with_no_limit_an_urgent_task_simply_starts(manager, store, runner):
+    await fill(manager, store, priority=4)
+    urgent = make_task(store, priority=1, title="urgent")
+
+    events = await manager.submit(urgent)
+
+    assert kinds(events, PreemptionProposal) == []
+    assert [e.task_id for e in kinds(events, TaskStarted)] == [urgent.id]
 
 
 async def test_no_preemption_is_proposed_for_a_task_that_still_could_not_start(
     config, store, runner, workspace, clock, tmp_path
 ):
-    """`notes` is not a git repo, so it takes one slot at a time.
-    Killing the webapp task frees a slot the notes task still cannot use -
-    and the scheduler would put the killed task straight back in it."""
+    """`notes` is not a git repo, so it runs one agent at a time.
+    Killing the webapp task makes room the notes task still cannot use -
+    and the scheduler would put the killed task straight back."""
     workspace.non_git.add("notes")
-    manager = two_slot_manager(tmp_path, store, runner, workspace, clock)
+    manager = limited_manager(tmp_path, store, runner, workspace, clock, 2)
     await manager.submit(make_task(store, project="notes", priority=1, title="notes A1"))
     await manager.submit(make_task(store, project="webapp", priority=5, title="webapp B1"))
 
@@ -700,7 +733,7 @@ async def test_the_victim_is_the_task_actually_in_the_way(
     """Same shape, but the notes task that holds the lock is the lower priority
     of the two running. Preempting *it* is the only preemption that helps."""
     workspace.non_git.add("notes")
-    manager = two_slot_manager(tmp_path, store, runner, workspace, clock)
+    manager = limited_manager(tmp_path, store, runner, workspace, clock, 2)
     holder = make_task(store, project="notes", priority=4, title="notes holder")
     await manager.submit(holder)
     await manager.submit(make_task(store, project="webapp", priority=5, title="webapp B1"))
@@ -712,78 +745,95 @@ async def test_the_victim_is_the_task_actually_in_the_way(
     events = await manager.accept_preemption(proposal.proposal_id)
     started = kinds(events, TaskStarted)
     assert [e.task_id for e in started] == [urgent.id]
-    assert runner.killed == [proposal.victim_slot]
+    assert runner.killed == [proposal.victim_agent]
+
+
+async def test_a_non_git_projects_lock_is_preempted_even_without_a_limit(
+    manager, store, runner, workspace
+):
+    """No cap, so room is never the problem - but a non-git project still
+    runs one agent at a time, and that is worth a question."""
+    workspace.non_git.add("notes")
+    holder = make_task(store, project="notes", priority=4, title="notes holder")
+    await manager.submit(holder)
+
+    urgent = make_task(store, project="notes", priority=1, title="notes urgent")
+    [proposal] = kinds(await manager.submit(urgent), PreemptionProposal)
+
+    assert proposal.victim_agent == holder.agent
 
 
 async def test_accepting_a_stale_preemption_says_so_and_stops_nothing(
-    manager, store, runner, config
+    capped, store, runner, config
 ):
     """The victim finished between the proposal and the yes; the
     acceptance used to pass silently and report success."""
     from buddy.manager import StalePreemption
 
-    await fill_all_slots(manager, store, priority=4)
-    [proposal] = kinds(await manager.submit(make_task(store, priority=1)), PreemptionProposal)
+    await fill(capped, store, priority=4)
+    [proposal] = kinds(await capped.submit(make_task(store, priority=1)), PreemptionProposal)
 
-    runner.panes_state[proposal.victim_slot] = PaneStatus(exists=True, dead=True, exit_code=0)
-    await manager.tick()  # the victim finishes; the urgent task takes its slot
+    runner.finish(proposal.victim_agent, 0)
+    await capped.tick()  # the victim finishes; the urgent task takes its place
 
     with pytest.raises(StalePreemption, match="no longer"):
-        await manager.accept_preemption(proposal.proposal_id)
+        await capped.accept_preemption(proposal.proposal_id)
     assert runner.killed == []
 
 
-async def test_no_proposal_when_the_newcomer_does_not_outrank_anything(manager, store):
-    await fill_all_slots(manager, store, priority=1)
-    events = await manager.submit(make_task(store, priority=2))
+async def test_no_proposal_when_the_newcomer_does_not_outrank_anything(capped, store):
+    await fill(capped, store, priority=1)
+    events = await capped.submit(make_task(store, priority=2))
     assert kinds(events, PreemptionProposal) == []
 
 
-async def test_the_lowest_priority_running_task_is_the_victim(manager, store):
-    for priority in (1, 2, 5, 3, 1, 1, 2):
-        await manager.submit(make_task(store, priority=priority))
-    events = await manager.submit(make_task(store, priority=1, title="urgent"))
+async def test_the_lowest_priority_running_task_is_the_victim(capped, store):
+    running = [make_task(store, priority=priority) for priority in (1, 2, 5, 3, 1, 1, 2)]
+    for task in running:
+        await capped.submit(task)
+    events = await capped.submit(make_task(store, priority=1, title="urgent"))
     proposal = kinds(events, PreemptionProposal)[0]
-    assert proposal.victim_slot == "Wednesday"  # the priority-5 one
+    assert proposal.victim_agent == running[2].agent  # the priority-5 one
 
 
-async def test_accepting_a_preemption_loses_nothing(manager, store, runner, workspace):
-    victims = await fill_all_slots(manager, store, priority=4)
+async def test_accepting_a_preemption_loses_nothing(capped, store, runner, workspace):
+    victims = await fill(capped, store, priority=4)
     urgent = make_task(store, priority=1, title="urgent")
-    events = await manager.submit(urgent)
+    events = await capped.submit(urgent)
     proposal = kinds(events, PreemptionProposal)[0]
     victim_id = proposal.victim_task_id
 
-    events = await manager.accept_preemption(proposal.proposal_id)
+    events = await capped.accept_preemption(proposal.proposal_id)
 
-    assert proposal.victim_slot in runner.killed
+    assert proposal.victim_agent in runner.killed
     assert (victim_id, 1, RunOutcome.PREEMPTED) in workspace.checkpoints
     assert store.get_run(victim_id, 1).outcome is RunOutcome.PREEMPTED
-    # Requeued at its original priority, one attempt later.
+    # Requeued at its original priority, one attempt later, same name.
     requeued = store.get_task(victim_id)
     assert requeued.priority == 4
     assert requeued.attempt == 2
+    assert requeued.agent == proposal.victim_agent
     assert store.get_task_state(victim_id) is TaskState.QUEUED
-    # The incoming task took the freed slot.
+    # The incoming task took the room it made.
     assert kinds(events, TaskStarted)[0].task_id == urgent.id
     assert victims  # the rest are untouched
 
 
-async def test_declining_a_preemption_leaves_everything_running(manager, store, runner):
-    await fill_all_slots(manager, store, priority=4)
-    events = await manager.submit(make_task(store, priority=1))
+async def test_declining_a_preemption_leaves_everything_running(capped, store, runner):
+    await fill(capped, store, priority=4)
+    events = await capped.submit(make_task(store, priority=1))
     proposal = kinds(events, PreemptionProposal)[0]
 
-    manager.decline_preemption(proposal.proposal_id)
+    capped.decline_preemption(proposal.proposal_id)
 
     assert runner.killed == []
-    assert manager.pending_preemptions == {}
+    assert capped.pending_preemptions == {}
 
 
-async def test_the_same_task_is_not_proposed_twice(manager, store):
-    await fill_all_slots(manager, store, priority=4)
-    await manager.submit(make_task(store, priority=1))
-    assert kinds(await manager.tick(), PreemptionProposal) == []
+async def test_the_same_task_is_not_proposed_twice(capped, store):
+    await fill(capped, store, priority=4)
+    await capped.submit(make_task(store, priority=1))
+    assert kinds(await capped.tick(), PreemptionProposal) == []
 
 
 async def test_an_unknown_proposal_is_an_error(manager):
@@ -794,44 +844,44 @@ async def test_an_unknown_proposal_is_an_error(manager):
 # -- the brain's tools ---------------------------------------------
 
 
-async def test_list_agents_reports_the_slot_table(manager, store, runner, config):
-    task = make_task(store, priority=2, title="Fix onboarding")
+async def test_list_agents_names_every_running_agent(manager, store, runner, config):
+    task = make_task(store, priority=2, title="Fix onboarding", agent="onboarder")
     await manager.submit(task)
+    await manager.submit(make_task(store, priority=1, title="urgent", agent="first"))
     write_log(store, config, task.id, "line one\nline two\nline three\n")
     await manager.tick()
 
     rows = manager.list_agents()
-    assert len(rows) == 7
-    monday = next(row for row in rows if row["slot"] == "Monday")
-    assert monday["task_id"] == task.id
-    assert monday["title"] == "Fix onboarding"
-    assert monday["branch"] == f"buddy/{task.id}-slug"
-    assert monday["priority"] == 2
-    assert monday["tail"].count("\n") <= 1  # two lines
-    assert rows[0]["slot"] == "Monday"  # sorted by priority
+    assert [row["agent"] for row in rows] == ["first", "onboarder"]  # most urgent first
+    row = rows[1]
+    assert row["task_id"] == task.id
+    assert row["title"] == "Fix onboarding"
+    assert row["branch"] == f"buddy/{task.id}-slug"
+    assert row["priority"] == 2
+    assert row["tail"].count("\n") <= 1  # two lines
 
 
-async def test_get_output_accepts_a_slot_or_a_task_id(manager, store, runner, config):
-    task = make_task(store)
+async def test_get_output_accepts_an_agents_name_or_a_task_id(manager, store, runner, config):
+    task = make_task(store, agent="scout")
     await manager.submit(task)
     write_log(store, config, task.id, "\x1b[32mcoloured\x1b[0m output\n")
 
-    assert "coloured output" in manager.get_output("Monday")
+    assert "coloured output" in manager.get_output("Scout")
     assert "coloured output" in manager.get_output(task.id)
-    assert "\x1b" not in manager.get_output("Monday")  # ANSI stripped
-    assert manager.get_output("Sunday") == ""
+    assert "\x1b" not in manager.get_output("scout")  # ANSI stripped
+    assert manager.get_output("nobody") == ""
 
 
-async def test_reprioritize_reorders_the_queue(manager, store, runner):
-    await fill_all_slots(manager, store)
+async def test_reprioritize_reorders_the_queue(capped, store, runner):
+    await fill(capped, store)
     low = make_task(store, priority=5, title="low")
     high = make_task(store, priority=4, title="high")
-    await manager.submit(low)
-    await manager.submit(high)
+    await capped.submit(low)
+    await capped.submit(high)
 
-    manager.reprioritize(low.id, 1)
+    capped.reprioritize(low.id, 1)
 
-    assert [task.id for task in manager.ready_tasks()] == [low.id, high.id]
+    assert [task.id for task in capped.ready_tasks()] == [low.id, high.id]
 
 
 async def test_reprioritizing_a_running_task_only_changes_its_rank(manager, store, runner):
@@ -839,63 +889,64 @@ async def test_reprioritizing_a_running_task_only_changes_its_rank(manager, stor
     await manager.submit(task)
     manager.reprioritize(task.id, 1)
     assert store.get_task(task.id).priority == 1
-    assert manager._slot("Monday").priority == 1
+    assert manager.agent(task.agent).priority == 1
     assert runner.killed == []
 
 
-async def test_queue_position_reports_how_many_outrank_it(manager, store):
-    await fill_all_slots(manager, store, priority=2)
+async def test_queue_position_reports_how_many_outrank_it(capped, store):
+    await fill(capped, store, priority=2)
     first = make_task(store, priority=3)
     second = make_task(store, priority=4)
-    await manager.submit(first)
-    await manager.submit(second)
-    assert manager.queue_position(first.id) == 0
-    assert manager.queue_position(second.id) == 1
+    await capped.submit(first)
+    await capped.submit(second)
+    assert capped.queue_position(first.id) == 0
+    assert capped.queue_position(second.id) == 1
 
 
 async def test_kill_marks_the_task_killed_and_does_not_requeue(manager, store, runner, workspace):
     """Kill means kill; pausing is a different thing."""
-    task = make_task(store)
+    task = make_task(store, agent="scout")
     await manager.submit(task)
 
-    events = await manager.kill_agent("Monday")
+    events = await manager.kill_agent("SCOUT")
 
-    assert "Monday" in runner.killed
+    assert "scout" in runner.killed
     assert (task.id, 1, RunOutcome.KILLED) in workspace.checkpoints
     assert store.get_task_state(task.id) is TaskState.KILLED
-    assert kinds(events, TaskFinished)[0].outcome is RunOutcome.KILLED
+    finished = kinds(events, TaskFinished)[0]
+    assert finished.outcome is RunOutcome.KILLED and finished.agent == "scout"
     assert store.get_task(task.id).attempt == 1
-    assert manager._slot("Monday").status is SlotStatus.KILLED
+    assert manager.agents() == []
 
 
-async def test_killing_frees_the_slot_for_the_queue(manager, store, runner):
-    await fill_all_slots(manager, store)
+async def test_killing_makes_room_for_the_queue(capped, store, runner):
+    running = await fill(capped, store)
     waiting = make_task(store)
-    await manager.submit(waiting)
+    await capped.submit(waiting)
 
-    await manager.kill_agent("Monday")
+    await capped.kill_agent(running[0].agent)
 
     assert runner.spawned[-1][1] == waiting.id
 
 
-async def test_killing_an_idle_slot_is_harmless(manager, store, runner):
-    assert await manager.kill_agent("Sunday") == []
+async def test_killing_an_agent_that_is_not_running_says_so(manager):
+    with pytest.raises(KeyError, match="no running agent is called nobody"):
+        await manager.kill_agent("nobody")
 
 
 # -- crash and error paths, from the code review ---------------------------
 
 
-async def test_one_slot_failing_does_not_stop_the_other_six(manager, store, runner, workspace):
+async def test_one_agent_failing_does_not_stop_the_others(manager, store, runner, workspace):
     """A disk-full worktree, a stray index.lock, a repo hook that
-    `--no-verify` does not suppress: any of them made one slot's checkpoint
-    raise, and the exception left `tick` entirely - so every other slot
+    `--no-verify` does not suppress: any of them made one agent's checkpoint
+    raise, and the exception left `tick` entirely - so every other agent
     stopped being finalized, stalled-checked and scheduled too."""
     first, second = make_task(store, title="one"), make_task(store, title="two")
     await manager.submit(first)
     await manager.submit(second)
-    slots = {s.task_id: s.name for s in manager.slots() if s.task_id}
-    runner.finish(slots[first.id], 0)
-    runner.finish(slots[second.id], 0)
+    runner.finish(first.agent, 0)
+    runner.finish(second.agent, 0)
 
     failed: list[str] = []
     real = workspace.checkpoint
@@ -911,21 +962,14 @@ async def test_one_slot_failing_does_not_stop_the_other_six(manager, store, runn
 
     assert failed == [first.id]
     finished = [e.task_id for e in events if isinstance(e, TaskFinished)]
-    assert second.id in finished, "the healthy slot was never finalized"
+    assert second.id in finished, "the healthy agent was never finalized"
     # And the failure is visible rather than silent.
-    assert any(isinstance(e, SlotHealthChanged) and "tick failed" in e.detail for e in events)
+    assert any(isinstance(e, AgentHealthChanged) and "tick failed" in e.detail for e in events)
 
 
-async def test_a_crash_between_kill_and_the_db_write_does_not_wedge_a_slot(
-    config, store, runner, workspace, clock
-):
-    """`kill` respawns the window into a live idle shell *before*
-    the outcome, task state and slot are written. A crash in that gap left a
-    live shell that looked exactly like a running task: the pane never dies,
-    so nothing finalizes it, and `_orphaned_runs` cannot see it either
-    because the outcome was already written. The slot was held forever.
-    """
-    manager = AgentManager(
+def fresh_manager(config, store, runner, workspace, clock) -> AgentManager:
+    """Another Buddy process, starting up over the same state."""
+    return AgentManager(
         config,
         store,
         runner,
@@ -933,63 +977,73 @@ async def test_a_crash_between_kill_and_the_db_write_does_not_wedge_a_slot(
         adapter_for=lambda name: ClaudeCodeAdapter(config.harness(name)),
         now=clock,
     )
+
+
+async def test_a_crash_after_a_preemption_is_recorded_requeues_the_task(
+    manager, config, store, runner, workspace, clock
+):
+    """The attempt's outcome was written and the process died before its
+    agent was retired. The agent must not be held forever: the pane is gone
+    or dead, so nothing finalizes it, and `_orphaned_runs` cannot see it
+    because the outcome is already there."""
     task = make_task(store, title="interrupted by a crash")
     await manager.submit(task)
-    slot_name = next(s.name for s in manager.slots() if s.task_id == task.id)
 
-    # The first half of `_stop_and_requeue`, and then nothing.
+    # The first half of stopping it, and then nothing.
     run = store.get_run(task.id, 1)
-    await runner.kill(slot_name)  # pane is now a live idle shell
+    await runner.kill(task.agent)
     run.ended_at = clock()
     run.outcome = RunOutcome.PREEMPTED
     store.save_run(run)  # ... and the process dies here
+    assert store.get_agent(task.agent) is not None, "precondition: still claimed"
 
-    assert store.load_slots()[0] is not None
-    wedged = next(s for s in store.load_slots() if s.name == slot_name)
-    assert wedged.status.is_occupied, "precondition: the slot still claims the task"
+    events = await fresh_manager(config, store, runner, workspace, clock).reconcile()
 
-    fresh = AgentManager(
-        config,
-        store,
-        runner,
-        workspace,
-        adapter_for=lambda name: ClaudeCodeAdapter(config.harness(name)),
-        now=clock,
-    )
-    events = await fresh.reconcile()
-
-    after = next(s for s in fresh.slots() if s.name == slot_name)
-    assert not after.status.is_occupied, "the slot is still wedged"
+    assert store.get_agent(task.agent) is None, "the agent is still held"
     assert store.get_task_state(task.id) is TaskState.QUEUED
     assert any(isinstance(e, TaskRequeued) for e in events)
 
 
 async def test_a_killed_run_interrupted_mid_write_stays_killed(
-    config, store, runner, workspace, clock
+    manager, config, store, runner, workspace, clock
 ):
     """Kill means kill: recovering the bookkeeping must not quietly
     turn one back into a queued task."""
-    manager = AgentManager(
-        config,
-        store,
-        runner,
-        workspace,
-        adapter_for=lambda name: ClaudeCodeAdapter(config.harness(name)),
-        now=clock,
-    )
     task = make_task(store, title="killed on purpose")
     await manager.submit(task)
-    slot_name = next(s.name for s in manager.slots() if s.task_id == task.id)
 
     run = store.get_run(task.id, 1)
-    await runner.kill(slot_name)
+    await runner.kill(task.agent)
     run.ended_at = clock()
     run.outcome = RunOutcome.KILLED
     store.save_run(run)
 
-    await manager.reconcile()
+    await fresh_manager(config, store, runner, workspace, clock).reconcile()
     assert store.get_task_state(task.id) is TaskState.KILLED
-    assert not next(s for s in manager.slots() if s.name == slot_name).status.is_occupied
+    assert store.get_agent(task.agent) is None
+
+
+async def test_a_run_finalized_before_a_crash_keeps_its_verdict(
+    manager, config, store, runner, workspace, clock
+):
+    """Finalizing writes the outcome and the task's state, then retires the
+    agent. A crash in between must not turn a finished task into an error
+    or back into a queued one."""
+    task = make_task(store, title="finished just before the crash")
+    await manager.submit(task)
+    run = store.get_run(task.id, 1)
+    run.outcome = RunOutcome.DONE
+    run.exit_code = 0
+    store.save_run(run)
+    store.set_task_state(task.id, TaskState.DONE)
+    runner.finish(task.agent, 0)
+
+    events = await fresh_manager(config, store, runner, workspace, clock).reconcile()
+
+    assert store.get_task_state(task.id) is TaskState.DONE
+    assert store.get_agent(task.agent) is None
+    assert task.agent in runner.closed
+    assert not kinds(events, TaskRequeued)
 
 
 async def test_finalizing_never_walks_a_merged_task_backwards(manager, store, runner):
@@ -997,10 +1051,9 @@ async def test_finalizing_never_walks_a_merged_task_backwards(manager, store, ru
     session was ticking, then a later tick noticing the pane had died."""
     task = make_task(store, title="already merged")
     await manager.submit(task)
-    slot_name = next(s.name for s in manager.slots() if s.task_id == task.id)
     store.set_task_state(task.id, TaskState.MERGED)
 
-    runner.finish(slot_name, 0)
+    runner.finish(task.agent, 0)
     await manager.tick()
 
     assert store.get_task_state(task.id) is TaskState.MERGED
@@ -1040,7 +1093,7 @@ async def test_what_a_checkpoint_kept_out_of_git_is_said_when_the_task_ends(
     task = make_task(store)
     await manager.submit(task)
     workspace.withheld = {(task.id, 1): [".env: holds secrets by its nature"]}
-    runner.panes_state["Monday"] = PaneStatus(exists=True, dead=True, exit_code=0)
+    runner.finish(task.agent, 0)
 
     [finished] = kinds(await manager.tick(), TaskFinished)
 
@@ -1064,21 +1117,21 @@ async def test_a_kill_removes_the_run_script(manager, store, config):
     await manager.submit(task)
     assert _script(config, task).exists()
 
-    await manager.kill_agent("Monday")
+    await manager.kill_agent(task.agent)
 
     assert not _script(config, task).exists()
 
 
-async def test_a_preemption_removes_the_victims_run_script(manager, store, config):
-    await fill_all_slots(manager, store, priority=4)
+async def test_a_preemption_removes_the_victims_run_script(capped, store, config):
+    await fill(capped, store, priority=4)
     urgent = make_task(store, priority=1, title="urgent")
-    proposal = kinds(await manager.submit(urgent), PreemptionProposal)[0]
+    proposal = kinds(await capped.submit(urgent), PreemptionProposal)[0]
     victim = store.get_task(proposal.victim_task_id)
 
-    await manager.accept_preemption(proposal.proposal_id)
+    await capped.accept_preemption(proposal.proposal_id)
 
     assert not _script(config, victim).exists()
-    assert _script(config, urgent).exists(), "the task that took the slot is running"
+    assert _script(config, urgent).exists(), "the task it made room for is running"
 
 
 async def test_a_timeout_replaces_the_run_script_rather_than_keeping_it(
@@ -1112,7 +1165,7 @@ async def test_finishing_removes_the_run_script_even_when_the_checkpoint_fails(
 ):
     task = make_task(store)
     await manager.submit(task)
-    runner.finish("Monday", 0)
+    runner.finish(task.agent, 0)
 
     async def full_disk(run, outcome=None):
         raise OSError("No space left on device")
@@ -1157,14 +1210,14 @@ async def test_a_task_whose_checkout_cannot_be_made_fails_alone(manager, store, 
 
 
 async def test_a_running_task_is_still_working(manager, store, runner):
-    task = make_task(store)
+    task = make_task(store, agent="scout")
     await manager.submit(task)
 
     reason = manager.still_working(task.id)
 
     assert reason is not None
-    assert "Monday" in reason and "buddy kill Monday" in reason
+    assert "as scout" in reason and "buddy kill scout" in reason
 
-    runner.finish("Monday", 0)
+    runner.finish("scout", 0)
     await manager.tick()
     assert manager.still_working(task.id) is None

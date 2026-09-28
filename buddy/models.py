@@ -1,4 +1,4 @@
-"""Slot, task, run, and event types.
+"""Agent, task, run, and event types.
 
 Pure data. Nothing here touches the filesystem, the database, tmux, or git.
 The string-valued enums exist so the vocabularies stored in SQLite and sent
@@ -8,22 +8,12 @@ wire values and no divergence between `str()` and `format()`.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-
-#: The seven slots. A name is a stable handle the user says out loud,
-#: never a priority rank. Ordered as the week runs, not as work is ranked.
-SLOT_NAMES: tuple[str, ...] = (
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday",
-)
 
 
 def utcnow() -> datetime:
@@ -32,52 +22,109 @@ def utcnow() -> datetime:
 
 
 # --------------------------------------------------------------------------
-# Agent slot
+# Agents
 # --------------------------------------------------------------------------
 
+#: The longest name an agent may have. Long enough for a description, short
+#: enough to say out loud and to fit a card and a tmux status line.
+AGENT_NAME_MAX = 32
 
-class SlotStatus(StrEnum):
-    IDLE = "idle"
+#: Letters and digits in any script, `-` and `_`, starting with a letter or
+#: digit. The first character matters: a name that starts with `-` reads as
+#: an option on every command line that takes one. Nothing here means
+#: anything to tmux's target syntax, which splits on `:` and `.`.
+_AGENT_NAME = re.compile(r"[^\W_][\w-]*")
+
+#: What a task id looks like. A name that looks like one would make
+#: `buddy logs t-0007` mean two different things.
+_TASK_ID = re.compile(r"t-\d+", re.IGNORECASE)
+
+
+class AgentNameError(ValueError):
+    """A name an agent cannot have, with the reason and what would work."""
+
+
+def normalize_agent_name(name: str) -> str:
+    """The name as it is stored: trimmed, with runs of spaces made `-`.
+
+    Spaces are the one thing people reliably say that a name cannot hold, so
+    "code reviewer" becomes `code-reviewer` rather than a refusal.
+    """
+    return re.sub(r"\s+", "-", name.strip())
+
+
+def check_agent_name(name: str) -> str:
+    """`name`, normalized, or an `AgentNameError` saying why it cannot be one."""
+    wanted = normalize_agent_name(name)
+    if not wanted:
+        raise AgentNameError("an agent's name cannot be empty")
+    if len(wanted) > AGENT_NAME_MAX:
+        raise AgentNameError(
+            f"{wanted!r} is {len(wanted)} characters; names are {AGENT_NAME_MAX} at most"
+        )
+    if not _AGENT_NAME.fullmatch(wanted):
+        raise AgentNameError(
+            f"{wanted!r} cannot be an agent's name: use letters, digits, '-' and '_', "
+            "starting with a letter or a digit"
+        )
+    if _TASK_ID.fullmatch(wanted):
+        raise AgentNameError(f"{wanted!r} looks like a task id; pick a name that does not")
+    return wanted
+
+
+def default_agent_name(title: str, taken: Collection[str] = ()) -> str:
+    """A name for an agent nobody named: the first words of its title.
+
+    `Add rate limiting to the API` becomes `add-rate-limiting` - short enough
+    to say, specific enough to recognise. A name already in use by a live
+    agent gets the first free `-2`, `-3`, ... after it.
+    """
+    words = re.findall(r"[^\W_]+", title.lower())
+    base = ""
+    for word in words[:3]:
+        candidate = f"{base}-{word}" if base else word
+        if len(candidate) > AGENT_NAME_MAX - 3:  # room for a suffix
+            break
+        base = candidate
+    if not base or _TASK_ID.fullmatch(base):
+        base = "agent"
+    lowered = {name.lower() for name in taken}
+    if base not in lowered:
+        return base
+    number = 2
+    while f"{base}-{number}" in lowered:
+        number += 1
+    return f"{base}-{number}"
+
+
+class AgentStatus(StrEnum):
+    """What a running agent is doing. An agent exists only while its task
+    runs, so there is no idle or finished status: the task's own state and
+    its runs record how it ended."""
+
     RUNNING = "running"
     WAITING_INPUT = "waiting_input"  # harness is asking a question
     STALLED = "stalled"  # no output for stall_timeout
-    DONE = "done"  # exit 0, awaiting next assignment
-    ERROR = "error"  # non-zero exit
-    KILLED = "killed"  # by you or by preemption
-    INTERRUPTED = "interrupted"  # Buddy/tmux died underneath it
-
-    @property
-    def is_occupied(self) -> bool:
-        """A slot holding a live task. DONE and ERROR keep their pane and log
-        for inspection but the slot is reusable, so they are not."""
-        return self in _OCCUPIED_STATUSES
-
-
-_OCCUPIED_STATUSES = frozenset(
-    {
-        SlotStatus.RUNNING,
-        SlotStatus.WAITING_INPUT,
-        SlotStatus.STALLED,
-    }
-)
 
 
 @dataclass
-class AgentSlot:
-    name: str  # "Monday".."Sunday" - a stable handle, not a rank
-    status: SlotStatus = SlotStatus.IDLE
-    task_id: str | None = None
-    run_attempt: int | None = None
+class Agent:
+    """A running task, under the name the user calls it by.
+
+    Also the name of its tmux window. Created when the task starts and
+    removed when that attempt ends; a requeued task keeps its name and gets
+    a new window when it starts again.
+    """
+
+    name: str
+    task_id: str
+    run_attempt: int
+    status: AgentStatus = AgentStatus.RUNNING
     harness: str | None = None
     priority: int | None = None
-    tmux_window: str = ""  # always == name
     started_at: datetime | None = None
     last_output_at: datetime | None = None  # last time the log file grew
     last_output: str = ""  # last ~20 lines, for status queries and voice summaries
-
-    def __post_init__(self) -> None:
-        if not self.tmux_window:
-            self.tmux_window = self.name
 
 
 # --------------------------------------------------------------------------
@@ -119,6 +166,10 @@ class TaskSpec:
     #: conflict fix starts from the branch that conflicted, so its merge of
     #: the base is made on top of that work rather than beside it.
     start_from: str | None = None
+    #: What the user calls this task's agent, and its tmux window's name.
+    #: Unique among queued and running tasks; given at spawn, or derived
+    #: from the title when nobody named it.
+    agent: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -157,7 +208,7 @@ _RESUMABLE_OUTCOMES = frozenset(
 class TaskRun:
     task_id: str
     attempt: int
-    slot: str
+    agent: str  # the name it ran under
     worktree: Path
     branch: str
     base_ref: str  # commit the branch was cut from
@@ -205,7 +256,7 @@ class BrainstormChanged(Event):
 @dataclass
 class TaskStarted(Event):
     task_id: str = ""
-    slot: str = ""
+    agent: str = ""
     attempt: int = 1
 
 
@@ -214,7 +265,7 @@ class TaskFinished(Event):
     """A run reached a terminal state."""
 
     task_id: str = ""
-    slot: str = ""
+    agent: str = ""
     attempt: int = 1
     outcome: RunOutcome = RunOutcome.DONE
     exit_code: int | None = None
@@ -242,22 +293,22 @@ class TaskBlocked(Event):
 
 
 @dataclass
-class SlotHealthChanged(Event):
-    """WAITING_INPUT or STALLED. Buddy notifies and never acts alone."""
+class AgentHealthChanged(Event):
+    """WAITING_INPUT or STALLED, or back to RUNNING. Buddy notifies and never
+    acts alone."""
 
-    slot: str = ""
+    agent: str = ""
     task_id: str = ""
-    status: SlotStatus = SlotStatus.RUNNING
+    status: AgentStatus = AgentStatus.RUNNING
     detail: str = ""
 
 
 @dataclass
 class PreemptionProposal(Event):
-    """Raised when the top ready task outranks a running one. The
-     manager never preempts on its own; the brain asks and the user answers
-    ."""
+    """Raised when the top ready task outranks a running one. The manager
+    never preempts on its own; the brain asks and the user answers."""
 
     proposal_id: str = ""
-    victim_slot: str = ""
+    victim_agent: str = ""
     victim_task_id: str = ""
     incoming_task_id: str = ""

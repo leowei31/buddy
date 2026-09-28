@@ -32,7 +32,7 @@ def make_run(tmp_path: Path) -> TaskRun:
     return TaskRun(
         task_id="t-0142",
         attempt=1,
-        slot="Tuesday",
+        agent="scout",
         worktree=tmp_path / "wt",
         branch="buddy/t-0142-x",
         base_ref="abc",

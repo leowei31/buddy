@@ -17,9 +17,9 @@ Booleans must be unquoted: `trust_mode = "false"` is refused rather than silentl
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `max_concurrent` | int | `7` | How many agents may run at once. Capped at seven, because there are seven slots. |
+| `max_concurrent` | int | `0` | How many agents may run at once. `0` means no limit: everything that is ready starts. Set one to cap what runs - and what it costs - at a time; a queued task that outranks a running one then gets a [preemption](operating.md#preemption) question. |
 | `default_priority` | int | `3` | Priority for a task that does not name one. 1 is urgent, 5 is whenever. |
-| `stall_timeout` | duration | `"10m"` | No output for this long marks a slot `stalled`. Buddy **notifies and never kills**: a long compile looks exactly like a hang, so the decision is yours. |
+| `stall_timeout` | duration | `"10m"` | No output for this long marks an agent `stalled`. Buddy **notifies and never kills**: a long compile looks exactly like a hang, so the decision is yours. |
 | `max_runtime` | duration | `"2h"` | Then the task is killed, checkpointed and requeued once. A second timeout is an error. |
 | `web_port` | int | `4321` | The dashboard's port, bound to `127.0.0.1` only. |
 | `trust_mode` | bool | `false` | `true` stops Buddy asking before anything - spawn, kill, merge, discard. See the warning below. |
@@ -94,7 +94,7 @@ The name is what you say out loud: *"spawn something on **webapp** to..."*
 | `default_harness` | str | see below | Which harness to use when a task does not name one. Unset, it is `claude_code` if that is configured, and otherwise the first configured harness alphabetically. |
 | `worktree_root` | path | `~/.buddy/worktrees/<name>` | Where this project's worktrees live. |
 
-A project that is **not** a git repository still works, but takes a slot exclusively: agents run in place, one at a time, because there is no worktree to isolate them.
+A project that is **not** a git repository still works, but runs one agent at a time, in place, because there is no worktree to isolate them.
 
 ## `[harness.<name>]`
 
@@ -115,7 +115,7 @@ If you change one, `buddy doctor` warns about the changes known to break a harne
 |---|---|---|---|
 | `command` | str | per harness, above | The command line. Placeholders below. A block with an empty command is *parked*: configured, never given a task. |
 | `default_model` | str | per harness, above | Used when a task names no model. Model names are the harness's own: OpenCode's are `provider/model`. |
-| `waiting_patterns` | list[str] | per harness | Regexes that mean the harness is asking a question, which marks the slot `waiting_input`. Only Claude Code and Antigravity ship any; Codex and OpenCode never stop to ask. |
+| `waiting_patterns` | list[str] | per harness | Regexes that mean the harness is asking a question, which marks the agent `waiting_input`. Only Claude Code and Antigravity ship any; Codex and OpenCode never stop to ask. |
 | `sandbox` | str | `"none"` | `"docker"` runs the harness in a container. |
 | `sandbox_command` | str | - | Required when `sandbox = "docker"`. Placeholders below. |
 
@@ -255,7 +255,7 @@ Without a `FISH_API_KEY` either, Buddy simply does not speak - everything else w
 
 ```toml
 [buddy]
-max_concurrent   = 7
+max_concurrent   = 0              # agents running at once; 0 = no limit
 default_priority = 3
 stall_timeout    = "10m"
 max_runtime      = "2h"
@@ -306,7 +306,7 @@ The directory itself is mode `0700`, and an older install is tightened on the ne
 | Path | What it is |
 |---|---|
 | `config.toml` | This file, mode `0600`. |
-| `state.db` | SQLite (WAL), mode `0600`: tasks, runs, slots, the conversation and its search index, pinned memory. |
+| `state.db` | SQLite (WAL), mode `0600`: tasks, runs, running agents, the conversation and its search index, pinned memory. |
 | `brainstorm.json` | Whether a brainstorm is on, and its drafts. Survives a restart. |
 | `control.sock` | The unix socket the overlay types through, mode `0600`, while a session runs. |
 | `tasks/<id>/prompt.md` | The brief that was sent. |

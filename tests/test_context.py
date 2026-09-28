@@ -1,4 +1,4 @@
-"""Compaction: summary written, recent turns kept, slot table fresh, null-content
+"""Compaction: summary written, recent turns kept, agent table fresh, null-content
 fallback, plus the brain's tools and confirmation tiers.
 
 A scripted fake provider stands in for the model, so the tests assert what
@@ -153,7 +153,6 @@ def config(tmp_path: Path, project: Path) -> Config:
 @pytest.fixture
 def store(config: Config) -> Store:
     with Store(config.paths.db) as s:
-        s.ensure_slots()
         yield s
 
 
@@ -205,16 +204,17 @@ def make_task(store: Store, **overrides) -> TaskSpec:
 # --------------------------------------------------------------------------
 
 
-async def test_the_slot_table_is_injected_fresh_every_turn(brain, manager, store, provider):
+async def test_the_agent_table_is_injected_fresh_every_turn(brain, manager, store, provider):
     await brain.send("hello")
     first = json.dumps(provider.last()["messages"], default=str)
-    assert "Monday" in first
+    assert "Running agents: none" in first
     assert "Queue: empty" in first
 
-    await manager.submit(make_task(store, title="Fix onboarding"))
+    await manager.submit(make_task(store, title="Fix onboarding", agent="onboarder"))
     await brain.send("what now")
 
     second = json.dumps(provider.last()["messages"], default=str)
+    assert "onboarder" in second
     assert "Fix onboarding" in second
     assert "running" in second
 
@@ -232,7 +232,7 @@ async def test_state_is_folded_into_the_user_turn_otherwise(config, store, manag
     await brain.send("hello")
     sent = plain.last()["messages"]
     assert all(turn.role is not Role.SYSTEM for turn in sent)
-    assert "Current slots" in sent[-1].text
+    assert "Running agents" in sent[-1].text
 
 
 async def test_pinned_memory_and_the_latest_summary_ride_in_the_system_prompt(brain, store):
@@ -269,7 +269,7 @@ async def test_the_brain_never_receives_a_whole_log(brain, manager, store, confi
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("\n".join(f"line {i}" for i in range(500)))
 
-    outcome = await brain.call_tool(ToolCall("c", "get_output", {"target": "Monday"}))
+    outcome = await brain.call_tool(ToolCall("c", "get_output", {"target": task.agent}))
     assert outcome.text.count("\n") <= 4
 
 
@@ -496,7 +496,9 @@ async def test_nothing_is_asked_under_trust_mode(config, store, manager, provide
         provider,
         confirm=lambda prompt, tier: asked.append(prompt) or True,
     )
-    await brain.call_tool(ToolCall("c", "kill_agent", {"slot": "Monday"}))
+    await manager.submit(make_task(store, agent="scout"))
+    outcome = await brain.call_tool(ToolCall("c", "kill_agent", {"agent": "scout"}))
+    assert outcome.text.startswith("killed scout")
     assert asked == []
 
 
@@ -532,11 +534,61 @@ async def test_the_spawn_read_back_names_what_will_run(config, store, manager, p
 
 
 async def test_a_declined_kill_leaves_it_running(config, store, manager, provider):
-    await manager.submit(make_task(store))
+    await manager.submit(make_task(store, agent="scout"))
     brain = Brain(config, store, manager, Workspace(config), provider, confirm=lambda p, t: False)
-    outcome = await brain.call_tool(ToolCall("c", "kill_agent", {"slot": "Monday"}))
+    outcome = await brain.call_tool(ToolCall("c", "kill_agent", {"agent": "Scout"}))
     assert outcome.declined
     assert store.get_task_state(store.recent_tasks()[0].id) is TaskState.RUNNING
+
+
+async def test_killing_an_agent_that_is_not_running_names_the_ones_that_are(brain, manager, store):
+    await manager.submit(make_task(store, agent="scout"))
+    outcome = await brain.call_tool(ToolCall("c", "kill_agent", {"agent": "nobody"}))
+    assert "no running agent is called nobody" in outcome.text
+    assert "scout" in outcome.text
+
+
+async def test_the_user_names_the_agent_and_the_read_back_says_so(config, store, manager, provider):
+    seen: list[str] = []
+    brain = Brain(
+        config,
+        store,
+        manager,
+        Workspace(config),
+        provider,
+        confirm=lambda prompt, tier: seen.append(prompt) or True,
+    )
+    outcome = await brain.call_tool(
+        ToolCall(
+            "c",
+            "spawn_agent",
+            {"project": "webapp", "title": "Look at auth", "goal": "g", "name": "scout"},
+        )
+    )
+    assert seen[0].startswith("scout: Look at auth")
+    assert outcome.text.endswith("started as scout")
+    assert store.get_agent("scout") is not None
+
+
+async def test_a_taken_name_is_refused_before_anyone_is_asked(config, store, manager, provider):
+    await manager.submit(make_task(store, agent="scout"))
+    asked: list[str] = []
+    brain = Brain(
+        config,
+        store,
+        manager,
+        Workspace(config),
+        provider,
+        confirm=lambda prompt, tier: asked.append(prompt) or True,
+    )
+    outcome = await brain.call_tool(
+        ToolCall(
+            "c", "spawn_agent", {"project": "webapp", "title": "t", "goal": "g", "name": "Scout"}
+        )
+    )
+    assert "already" in outcome.text
+    assert asked == []
+    assert len(store.tasks_in_state(TaskState.QUEUED, TaskState.RUNNING)) == 1
 
 
 # --------------------------------------------------------------------------
@@ -1074,7 +1126,6 @@ async def test_an_unnamed_harness_is_the_one_that_is_configured(tmp_path, projec
     from buddy.harnesses.opencode import OpenCodeAdapter
 
     with Store(config.paths.db) as store:
-        store.ensure_slots()
         manager = AgentManager(
             config,
             store,

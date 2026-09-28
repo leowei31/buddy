@@ -1,7 +1,7 @@
 """Git worktrees, branches, checkpoints, merge and discard.
 
 The only module that knows git exists. Worktrees are the required
-isolation boundary: seven agents can work on one repo at once because
+isolation boundary: any number of agents can work on one repo at once because
 none of them shares a checkout, and none of them can reach your base branch
 without a deliberate `buddy merge`.
 
@@ -133,7 +133,7 @@ class Checkout:
 
     For a git project this is a worktree on its own branch. For a non-git
     project it is the project directory itself, with no branch, which is why
-    such a project takes a one-slot lock.
+    such a project runs one agent at a time.
     """
 
     path: Path
@@ -275,7 +275,7 @@ class Workspace:
         code, out, _ = await self._git_status(path, "rev-parse", "--is-inside-work-tree")
         return code == 0 and out.strip() == "true"
 
-    async def requires_exclusive_slot(self, project: str) -> bool:
+    async def requires_exclusive_run(self, project: str) -> bool:
         """True for a non-git project: two agents in one directory is the
         exact hazard worktrees exist to prevent."""
         return not await self.is_git_repo(self.config.project(project).path)
@@ -307,7 +307,7 @@ class Workspace:
             raise WorkspaceError(f"project {task.project!r} path does not exist: {repo}")
 
         if not await self.is_git_repo(repo):
-            # Runs in place, under a one-slot lock enforced by the manager.
+            # Runs in place, one agent at a time, which the manager enforces.
             return Checkout(path=repo, branch=None, base_ref="", is_worktree=False)
 
         worktree = self.config.worktree_path(task.project, task.id)

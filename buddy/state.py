@@ -17,26 +17,27 @@ import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from buddy.models import (
-    SLOT_NAMES,
-    AgentSlot,
+    Agent,
+    AgentNameError,
+    AgentStatus,
     RunOutcome,
-    SlotStatus,
     TaskRun,
     TaskSpec,
     TaskState,
+    default_agent_name,
     utcnow,
 )
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class StateError(Exception):
@@ -155,7 +156,43 @@ ALTER TABLE tasks ADD COLUMN resolves TEXT;
 ALTER TABLE tasks ADD COLUMN start_from TEXT;
 """
 
-MIGRATIONS: tuple[str, ...] = (_SCHEMA_V1, _SCHEMA_V2)
+#: v3: named agents instead of seven fixed slots. A task carries the name of
+#: its agent; `agents` holds only the ones running now. A task that was
+#: running in a slot keeps that slot's name, which is also its tmux window's,
+#: so upgrading mid-run loses nothing. Every other task is named for its id.
+_SCHEMA_V3 = """
+ALTER TABLE tasks ADD COLUMN agent TEXT NOT NULL DEFAULT '';
+UPDATE tasks SET agent = (SELECT s.name FROM slots s WHERE s.task_id = tasks.id)
+    WHERE id IN (
+        SELECT task_id FROM slots
+        WHERE task_id IS NOT NULL AND status IN ('running', 'waiting_input', 'stalled')
+    );
+UPDATE tasks SET agent = id WHERE agent = '';
+-- A name is a handle: two live agents can never answer to the same one.
+CREATE UNIQUE INDEX tasks_live_agent ON tasks (agent COLLATE NOCASE)
+    WHERE state IN ('queued', 'running');
+ALTER TABLE task_runs RENAME COLUMN slot TO agent;
+CREATE TABLE agents (
+    name            TEXT PRIMARY KEY COLLATE NOCASE,
+    task_id         TEXT NOT NULL,
+    run_attempt     INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    harness         TEXT,
+    priority        INTEGER,
+    started_at      TEXT,
+    last_output_at  TEXT,
+    last_output     TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO agents (name, task_id, run_attempt, status, harness, priority,
+                    started_at, last_output_at, last_output)
+    SELECT name, task_id, COALESCE(run_attempt, 1), status, harness, priority,
+           started_at, last_output_at, last_output
+    FROM slots
+    WHERE task_id IS NOT NULL AND status IN ('running', 'waiting_input', 'stalled');
+DROP TABLE slots;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3)
 
 
 # --------------------------------------------------------------------------
@@ -174,15 +211,14 @@ def _dt(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _slot_from_row(row: sqlite3.Row) -> AgentSlot:
-    return AgentSlot(
+def _agent_from_row(row: sqlite3.Row) -> Agent:
+    return Agent(
         name=row["name"],
-        status=SlotStatus(row["status"]),
         task_id=row["task_id"],
         run_attempt=row["run_attempt"],
+        status=AgentStatus(row["status"]),
         harness=row["harness"],
         priority=row["priority"],
-        tmux_window=row["tmux_window"],
         started_at=_dt(row["started_at"]),
         last_output_at=_dt(row["last_output_at"]),
         last_output=row["last_output"],
@@ -207,6 +243,7 @@ def _task_from_row(row: sqlite3.Row) -> TaskSpec:
         created_at=_dt(row["created_at"]),  # type: ignore[arg-type]
         resolves=row["resolves"],
         start_from=row["start_from"],
+        agent=row["agent"],
     )
 
 
@@ -214,7 +251,7 @@ def _run_from_row(row: sqlite3.Row) -> TaskRun:
     return TaskRun(
         task_id=row["task_id"],
         attempt=row["attempt"],
-        slot=row["slot"],
+        agent=row["agent"],
         worktree=Path(row["worktree"]),
         branch=row["branch"],
         base_ref=row["base_ref"],
@@ -294,7 +331,7 @@ class Store:
         else:
             self._conn.execute("COMMIT")
 
-    # -- slots ------------------------------------------------------
+    # -- schema, for setup ------------------------------------------
 
     def schema_version(self) -> int:
         """`PRAGMA user_version`, which the migrations advance.
@@ -316,49 +353,72 @@ class Store:
         ).fetchall()
         return {row["name"] for row in rows}
 
-    def ensure_slots(self, names: Sequence[str] = SLOT_NAMES) -> list[AgentSlot]:
-        """Create the seven slots once. Idempotent; never renames or reorders,
-        because a slot name is a handle the user says out loud."""
-        with self.transaction():
-            for name in names:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO slots (name, status, tmux_window) VALUES (?, ?, ?)",
-                    (name, SlotStatus.IDLE.value, name),
-                )
-        return self.load_slots()
+    # -- agents -----------------------------------------------------
 
-    def load_slots(self) -> list[AgentSlot]:
-        rows = self._conn.execute("SELECT * FROM slots").fetchall()
-        by_name = {row["name"]: _slot_from_row(row) for row in rows}
-        return [by_name[name] for name in SLOT_NAMES if name in by_name]
+    def load_agents(self) -> list[Agent]:
+        """Every running agent, most urgent first, then oldest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM agents ORDER BY priority IS NULL, priority ASC, started_at ASC, name ASC"
+        ).fetchall()
+        return [_agent_from_row(row) for row in rows]
 
-    def save_slot(self, slot: AgentSlot) -> None:
+    def get_agent(self, name: str) -> Agent | None:
+        """The running agent with this name, whatever its case."""
+        row = self._conn.execute("SELECT * FROM agents WHERE name = ?", (name,)).fetchone()
+        return _agent_from_row(row) if row else None
+
+    def save_agent(self, agent: Agent) -> None:
         self._conn.execute(
             """
-            INSERT INTO slots (name, status, task_id, run_attempt, harness, priority,
-                               tmux_window, started_at, last_output_at, last_output)
-            VALUES (:name, :status, :task_id, :run_attempt, :harness, :priority,
-                    :tmux_window, :started_at, :last_output_at, :last_output)
+            INSERT INTO agents (name, task_id, run_attempt, status, harness, priority,
+                                started_at, last_output_at, last_output)
+            VALUES (:name, :task_id, :run_attempt, :status, :harness, :priority,
+                    :started_at, :last_output_at, :last_output)
             ON CONFLICT (name) DO UPDATE SET
-                status=excluded.status, task_id=excluded.task_id,
-                run_attempt=excluded.run_attempt, harness=excluded.harness,
-                priority=excluded.priority, tmux_window=excluded.tmux_window,
-                started_at=excluded.started_at, last_output_at=excluded.last_output_at,
-                last_output=excluded.last_output
+                task_id=excluded.task_id, run_attempt=excluded.run_attempt,
+                status=excluded.status, harness=excluded.harness,
+                priority=excluded.priority, started_at=excluded.started_at,
+                last_output_at=excluded.last_output_at, last_output=excluded.last_output
             """,
             {
-                "name": slot.name,
-                "status": slot.status.value,
-                "task_id": slot.task_id,
-                "run_attempt": slot.run_attempt,
-                "harness": slot.harness,
-                "priority": slot.priority,
-                "tmux_window": slot.tmux_window,
-                "started_at": _iso(slot.started_at),
-                "last_output_at": _iso(slot.last_output_at),
-                "last_output": slot.last_output,
+                "name": agent.name,
+                "task_id": agent.task_id,
+                "run_attempt": agent.run_attempt,
+                "status": agent.status.value,
+                "harness": agent.harness,
+                "priority": agent.priority,
+                "started_at": _iso(agent.started_at),
+                "last_output_at": _iso(agent.last_output_at),
+                "last_output": agent.last_output,
             },
         )
+
+    def remove_agent(self, name: str) -> None:
+        self._conn.execute("DELETE FROM agents WHERE name = ?", (name,))
+
+    def live_agent_names(self) -> dict[str, str]:
+        """Names taken by queued or running tasks, lowercased, to their task ids."""
+        rows = self._conn.execute(
+            "SELECT agent, id FROM tasks WHERE state IN (?, ?)",
+            (TaskState.QUEUED.value, TaskState.RUNNING.value),
+        ).fetchall()
+        return {row["agent"].lower(): row["id"] for row in rows}
+
+    def task_for_agent(self, name: str) -> TaskSpec | None:
+        """The task an agent name refers to: the live one if there is one,
+        otherwise the most recent task that ran under that name."""
+        row = self._conn.execute(
+            """
+            SELECT * FROM tasks WHERE agent = ? COLLATE NOCASE
+            ORDER BY state IN (?, ?) DESC, created_at DESC, id DESC LIMIT 1
+            """,
+            (name, TaskState.QUEUED.value, TaskState.RUNNING.value),
+        ).fetchone()
+        return _task_from_row(row) if row else None
+
+    def find_task(self, target: str) -> TaskSpec | None:
+        """A task by id, or by the name of its agent."""
+        return self.get_task(target) or self.task_for_agent(target)
 
     # -- tasks ------------------------------------------------------
 
@@ -371,13 +431,30 @@ class Store:
         return f"t-{(row['n'] or 0) + 1:04d}"
 
     def create_task(self, task: TaskSpec, state: TaskState = TaskState.QUEUED) -> None:
+        """Save a new task. One with no agent name is given one from its title.
+
+        Raises `AgentNameError` when the name belongs to another queued or
+        running task. `AgentManager.submit` checks that first, with a better
+        message; this is what holds when two processes race for one name.
+        """
+        if not task.agent:
+            task.agent = default_agent_name(task.title, self.live_agent_names())
+        try:
+            self._insert_task(task, state)
+        except sqlite3.IntegrityError as exc:
+            holder = self.live_agent_names().get(task.agent.lower())
+            if holder is None or holder == task.id:
+                raise
+            raise AgentNameError(f"{task.agent} is already {holder}; pick another name") from exc
+
+    def _insert_task(self, task: TaskSpec, state: TaskState) -> None:
         self._conn.execute(
             """
             INSERT INTO tasks (id, title, brief, harness, model, project, priority,
                                depends_on, merge_required, max_runtime_s, stall_timeout_s,
                                attempt, created_from_utterance, created_at, state,
-                               resolves, start_from)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               resolves, start_from, agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.id,
@@ -397,6 +474,7 @@ class Store:
                 state.value,
                 task.resolves,
                 task.start_from,
+                task.agent,
             ),
         )
 
@@ -434,11 +512,19 @@ class Store:
         return [(_task_from_row(row), _dt(row["discarded_at"])) for row in rows]
 
     def update_task(self, task: TaskSpec) -> None:
-        """Persist the mutable fields: priority (reprioritize) and attempt
-        (requeue)."""
+        """Persist the mutable fields: priority (reprioritize), attempt
+        (requeue), and the agent's name for a task created without one."""
         self._conn.execute(
-            "UPDATE tasks SET priority = ?, attempt = ?, brief = ?, depends_on = ? WHERE id = ?",
-            (task.priority, task.attempt, task.brief, json.dumps(task.depends_on), task.id),
+            "UPDATE tasks SET priority = ?, attempt = ?, brief = ?, depends_on = ?, agent = ? "
+            "WHERE id = ?",
+            (
+                task.priority,
+                task.attempt,
+                task.brief,
+                json.dumps(task.depends_on),
+                task.agent,
+                task.id,
+            ),
         )
 
     def tasks_in_state(self, *states: TaskState) -> list[TaskSpec]:
@@ -469,14 +555,14 @@ class Store:
     def create_run(self, run: TaskRun) -> None:
         self._conn.execute(
             """
-            INSERT INTO task_runs (task_id, attempt, slot, worktree, branch, base_ref,
+            INSERT INTO task_runs (task_id, attempt, agent, worktree, branch, base_ref,
                                    log_path, started_at, ended_at, exit_code, outcome, wip_commit)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.task_id,
                 run.attempt,
-                run.slot,
+                run.agent,
                 str(run.worktree),
                 run.branch,
                 run.base_ref,
@@ -493,11 +579,12 @@ class Store:
         """Update the mutable tail of a run: how and when it ended."""
         cursor = self._conn.execute(
             """
-            UPDATE task_runs SET slot = ?, ended_at = ?, exit_code = ?, outcome = ?, wip_commit = ?
+            UPDATE task_runs SET agent = ?, ended_at = ?, exit_code = ?, outcome = ?,
+                                 wip_commit = ?
             WHERE task_id = ? AND attempt = ?
             """,
             (
-                run.slot,
+                run.agent,
                 _iso(run.ended_at),
                 run.exit_code,
                 run.outcome.value if run.outcome else None,

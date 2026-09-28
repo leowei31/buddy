@@ -22,7 +22,6 @@ from buddy.logs import DONE_SENTINEL, read_sentinels
 from buddy.manager import AgentManager
 from buddy.models import (
     RunOutcome,
-    SlotStatus,
     TaskRequeued,
     TaskSpec,
     TaskState,
@@ -76,8 +75,9 @@ def repo(tmp_path: Path) -> Path:
     return path
 
 
-def write_config(home: Path, repo: Path, command: str) -> Config:
+def write_config(home: Path, repo: Path, command: str, *, max_concurrent: int = 0) -> Config:
     (home / "config.toml").write_text(
+        f"[buddy]\nmax_concurrent = {max_concurrent}\n"
         f'[projects.webapp]\npath = "{repo}"\nbase_branch = "main"\n'
         f"[harness.script]\ncommand = {command!r}\n"
     )
@@ -91,7 +91,6 @@ class Buddy:
     def __init__(self, config: Config, socket: str) -> None:
         self.config = config
         self.store = Store(config.paths.db)
-        self.store.ensure_slots()
         self.runner = TmuxRunner(session="buddy-reconcile", socket_name=socket)
         self.workspace = Workspace(config)
         self.manager = AgentManager(
@@ -124,8 +123,8 @@ def make_task(store: Store, **overrides) -> TaskSpec:
     return TaskSpec(**(defaults | overrides))
 
 
-async def running_pane(buddy: Buddy, slot: str):
-    status = await buddy.runner.status(slot)
+async def running_pane(buddy: Buddy, agent: str):
+    status = await buddy.runner.status(agent)
     return status if status.alive else None
 
 
@@ -140,7 +139,7 @@ async def test_a_run_that_finished_while_buddy_was_down_is_finalized(
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    await wait_for(lambda: _dead(first, "Monday"))
+    await wait_for(lambda: _dead(first, task.agent))
     first.close()
 
     second = Buddy(config, socket)
@@ -149,13 +148,14 @@ async def test_a_run_that_finished_while_buddy_was_down_is_finalized(
     assert second.store.get_task_state(task.id) is TaskState.DONE
     assert second.store.get_run(task.id, 1).outcome is RunOutcome.DONE
     assert config.paths.result_file(task.id).exists()
-    assert second.manager._slot("Monday").status is SlotStatus.DONE
+    assert second.store.get_agent(task.agent) is None, "the agent is retired"
+    assert not await second.runner.window_exists(task.agent), "and its window is gone"
     assert events
     second.close()
 
 
-async def _dead(buddy: Buddy, slot: str):
-    status = await buddy.runner.status(slot)
+async def _dead(buddy: Buddy, agent: str):
+    status = await buddy.runner.status(agent)
     return status if status.dead else None
 
 
@@ -164,7 +164,7 @@ async def test_a_failed_run_is_finalized_as_an_error(tmp_path: Path, repo: Path,
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    await wait_for(lambda: _dead(first, "Monday"))
+    await wait_for(lambda: _dead(first, task.agent))
     first.close()
 
     second = Buddy(config, socket)
@@ -193,7 +193,7 @@ async def test_killing_tmux_mid_run_loses_no_work(tmp_path: Path, repo: Path, so
     await first.manager.submit(task)
     worktree = config.worktree_path("webapp", task.id)
     await wait_for(lambda: (worktree / "work.txt").exists())
-    assert await running_pane(first, "Monday")
+    assert await running_pane(first, task.agent)
     first.close()
 
     # tmux dies with the task mid-flight.
@@ -215,7 +215,8 @@ async def test_killing_tmux_mid_run_loses_no_work(tmp_path: Path, repo: Path, so
     assert second.store.get_task_state(task.id) is TaskState.QUEUED
     assert second.store.get_task(task.id).attempt == 2
     assert second.store.get_task(task.id).priority == 3
-    assert second.manager._slot("Monday").status is SlotStatus.IDLE
+    assert second.store.get_task(task.id).agent == task.agent, "it keeps its name"
+    assert second.store.get_agent(task.agent) is None
     second.close()
 
 
@@ -256,18 +257,18 @@ async def test_a_still_running_task_is_resumed_not_disturbed(
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    before = await first.runner.status("Monday")
+    before = await first.runner.status(task.agent)
     first.close()
 
     second = Buddy(config, socket)
     await second.manager.reconcile()
 
-    after = await second.runner.status("Monday")
+    after = await second.runner.status(task.agent)
     assert after.alive
     assert after.pid == before.pid  # the same process, never respawned
     assert after.piped  # the log pipe was verified
     assert second.store.get_task_state(task.id) is TaskState.RUNNING
-    assert second.manager._slot("Monday").status.is_occupied
+    assert second.store.get_agent(task.agent) is not None
     second.close()
 
 
@@ -287,7 +288,7 @@ async def test_a_missing_window_is_finalized_from_the_logs_sentinel(
     assert DONE_SENTINEL in log.read_text()
 
     # The window disappears without Buddy ever seeing the dead pane.
-    await first.runner._tmux("kill-window", "-t", first.runner.target("Monday"))
+    await first.runner._tmux("kill-window", "-t", first.runner.target(task.agent))
     first.close()
 
     second = Buddy(config, socket)
@@ -326,12 +327,14 @@ async def test_a_stale_sentinel_from_a_previous_task_is_not_believed(
 
 
 async def test_the_queue_is_rebuilt_from_the_database(tmp_path: Path, repo: Path, socket: str):
-    config = write_config(tmp_path, repo, "bash -c 'sleep 300'")
+    config = write_config(tmp_path, repo, "bash -c 'sleep 300'", max_concurrent=2)
     first = Buddy(config, socket)
     # Built and submitted one at a time: `next_task_id` only sees persisted
-    # tasks, so building all seven first would give them the same id.
-    for _ in range(7):
-        await first.manager.submit(make_task(first.store))
+    # tasks, so building them all first would give them the same id.
+    running = []
+    for _ in range(2):
+        running.append(make_task(first.store))
+        await first.manager.submit(running[-1])
     queued = make_task(first.store, priority=1, title="waiting its turn")
     await first.manager.submit(queued)
     assert first.store.get_task_state(queued.id) is TaskState.QUEUED
@@ -341,9 +344,10 @@ async def test_the_queue_is_rebuilt_from_the_database(tmp_path: Path, repo: Path
     await second.manager.reconcile()
 
     assert [task.id for task in second.manager.ready_tasks()] == [queued.id]
-    # And it starts as soon as a slot frees up.
-    await second.manager.kill_agent("Monday")
+    # And it starts, in a window of its own, as soon as there is room.
+    await second.manager.kill_agent(running[0].agent)
     assert second.store.get_task_state(queued.id) is TaskState.RUNNING
+    assert await running_pane(second, "waiting-its-turn")
     second.close()
 
 
@@ -351,8 +355,8 @@ async def test_reconciling_a_clean_slate_does_nothing(tmp_path: Path, repo: Path
     config = write_config(tmp_path, repo, "bash -c 'true'")
     buddy = Buddy(config, socket)
     assert await buddy.manager.reconcile() == []
-    assert all(slot.status is SlotStatus.IDLE for slot in buddy.manager.slots())
-    assert set(await buddy.runner.windows()) >= {"Monday", "Sunday"}
+    assert buddy.manager.agents() == []
+    assert not await buddy.runner.session_exists(), "nothing to run, so no windows"
     buddy.close()
 
 
@@ -361,7 +365,7 @@ async def test_reconcile_is_idempotent(tmp_path: Path, repo: Path, socket: str):
     buddy = Buddy(config, socket)
     task = make_task(buddy.store)
     await buddy.manager.submit(task)
-    await wait_for(lambda: _dead(buddy, "Monday"))
+    await wait_for(lambda: _dead(buddy, task.agent))
 
     await buddy.manager.reconcile()
     state = buddy.store.get_task_state(task.id)

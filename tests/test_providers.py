@@ -38,16 +38,16 @@ from buddy.providers.base import (
 TOOLS = [
     ToolDef(
         name="list_agents",
-        description="The slot table.",
+        description="Every running agent.",
         parameters={"type": "object", "properties": {}},
     ),
     ToolDef(
         name="get_output",
-        description="Tail of a slot's log.",
+        description="Tail of an agent's log.",
         parameters={
             "type": "object",
-            "properties": {"slot": {"type": "string"}, "lines": {"type": "integer"}},
-            "required": ["slot"],
+            "properties": {"target": {"type": "string"}, "lines": {"type": "integer"}},
+            "required": ["target"],
         },
     ),
 ]
@@ -59,11 +59,11 @@ CONVERSATION = [
         Role.ASSISTANT,
         [
             Text("Let me look."),
-            ToolCall(id="call_1", name="get_output", arguments={"slot": "Tuesday", "lines": 20}),
+            ToolCall(id="call_1", name="get_output", arguments={"target": "scout", "lines": 20}),
         ],
     ),
     Turn(Role.USER, [ToolResult(call_id="call_1", content="running tests...")]),
-    Turn.assistant("Tuesday is running tests."),
+    Turn.assistant("scout is running tests."),
 ]
 
 
@@ -178,7 +178,7 @@ def anthropic_final(*, with_tool_call=True, with_compaction=False, stop_reason="
     content: list[Any] = [_obj(type="text", text="Let me look.")]
     if with_tool_call:
         content.append(
-            _obj(type="tool_use", id="call_1", name="get_output", input={"slot": "Tuesday"})
+            _obj(type="tool_use", id="call_1", name="get_output", input={"target": "scout"})
         )
     if with_compaction:
         content.append(
@@ -251,12 +251,12 @@ def openai_chunks():
         delta(
             content=None,
             tool_calls=[
-                _obj(index=0, id="call_1", function=_obj(name="get_output", arguments='{"slot":'))
+                _obj(index=0, id="call_1", function=_obj(name="get_output", arguments='{"target":'))
             ],
         ),
         delta(
             content=None,
-            tool_calls=[_obj(index=0, id=None, function=_obj(name=None, arguments='"Tuesday"}'))],
+            tool_calls=[_obj(index=0, id=None, function=_obj(name=None, arguments='"scout"}'))],
         ),
         _obj(
             choices=[_obj(delta=_obj(content=None, tool_calls=None), finish_reason="tool_calls")],
@@ -319,7 +319,7 @@ def gemini_chunks():
             [
                 _obj(
                     text=None,
-                    function_call=_obj(id=None, name="get_output", args={"slot": "Tuesday"}),
+                    function_call=_obj(id=None, name="get_output", args={"target": "scout"}),
                 )
             ],
             usage=_obj(prompt_token_count=100, candidates_token_count=20),
@@ -369,10 +369,10 @@ async def test_a_tool_call_round_trips_into_canonical_form(name):
     ready = [event for event in events if isinstance(event, ToolCallReady)]
     assert len(ready) == 1
     assert ready[0].call.name == "get_output"
-    assert ready[0].call.arguments == {"slot": "Tuesday"}
+    assert ready[0].call.arguments == {"target": "scout"}
 
     calls = [b for b in events[-1].turn.blocks if isinstance(b, ToolCall)]
-    assert calls and calls[0].arguments["slot"] == "Tuesday"
+    assert calls and calls[0].arguments["target"] == "scout"
 
 
 @pytest.mark.parametrize("name", list(PROVIDERS))
@@ -390,7 +390,7 @@ async def test_a_full_conversation_serializes_without_loss(name):
     await collect(provider)
     request = json.dumps(client.recorder.last(), default=str)
     assert "get_output" in request
-    assert "Tuesday" in request
+    assert "scout" in request
     assert "running tests" in request  # the tool result
     assert "what is everyone doing" in request
 
@@ -408,7 +408,7 @@ async def test_tools_are_declared(name):
     await collect(provider)
     request = json.dumps(client.recorder.last(), default=str)
     assert "list_agents" in request
-    assert "The slot table." in request
+    assert "Every running agent." in request
 
 
 @pytest.mark.parametrize("name", list(PROVIDERS))
@@ -557,7 +557,7 @@ async def test_an_unreachable_provider_is_reported_not_raised():
 
 
 def test_mid_conversation_system_is_model_gated():
-    """Where Layer 0's fresh slot table goes without a cache miss."""
+    """Where Layer 0's fresh agent table goes without a cache miss."""
     from buddy.providers.anthropic import AnthropicProvider
 
     opus = AnthropicProvider("claude-opus-5", client=FakeAnthropicClient(anthropic_final()))
@@ -587,7 +587,7 @@ async def test_openai_assembles_tool_arguments_from_deltas():
     string-matched."""
     provider, _ = make_openai()
     ready = [e for e in await collect(provider) if isinstance(e, ToolCallReady)]
-    assert ready[0].call.arguments == {"slot": "Tuesday"}
+    assert ready[0].call.arguments == {"target": "scout"}
 
 
 async def test_openai_survives_unparseable_tool_arguments():

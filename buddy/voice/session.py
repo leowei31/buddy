@@ -1,7 +1,7 @@
 """The voice thread: two queues, one-request lookahead, and barge-in.
 
 The voice layer lives in its own thread with text in and text out at the
-brain's boundary, so nothing here knows what a task or a slot is - it turns
+brain's boundary, so nothing here knows what a task or an agent is - it turns
 speech into a string, hands it over, and turns the answer back into sound.
 
 The shape that matters: split the brain's reply at sentence

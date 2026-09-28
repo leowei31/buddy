@@ -20,7 +20,7 @@ from buddy import overlay
 from buddy.config import Config
 from buddy.harnesses.claude_code import ClaudeCodeAdapter
 from buddy.manager import AgentManager
-from buddy.models import SlotStatus
+from buddy.models import Agent, AgentStatus
 from buddy.state import Store
 from buddy.web.events import Hub
 from buddy.web.server import Dashboard, create_app
@@ -28,8 +28,6 @@ from buddy.workspace import Workspace
 
 
 class NullRunner:
-    async def ensure_session(self, slots=None) -> None: ...
-
     async def panes(self) -> dict:
         return {}
 
@@ -50,7 +48,6 @@ async def panel_server(panel_home: Path):
     config = Config.load(home=panel_home)
     config.paths.ensure()
     store = Store(config.paths.db)
-    store.ensure_slots()
     workspace = Workspace(config)
     app = create_app(
         config=config,
@@ -93,7 +90,7 @@ def test_the_page_fetches_only_the_read_only_api():
     reading the same routes rather than by being trusted not to."""
     page = OVERLAY_PAGE.read_text()
     fetched = set(re.findall(r'fetch\("([^"]+)"', page))
-    assert fetched == {"/api/slots", "/api/tasks?state=queued&limit=100", "/api/brainstorm"}
+    assert fetched == {"/api/agents", "/api/tasks?state=queued&limit=100", "/api/brainstorm"}
     for verb in ("POST", "PUT", "DELETE", "PATCH"):
         assert verb not in page
 
@@ -112,17 +109,17 @@ def test_the_page_never_builds_markup_from_data():
 # -- the summary -----------------------------------------------------------
 
 
-async def test_the_summary_reads_the_live_slots(panel_server):
+async def test_the_summary_reads_the_running_agents(panel_server):
     dashboard, store = panel_server
-    for name, status in (("Monday", SlotStatus.RUNNING), ("Friday", SlotStatus.WAITING_INPUT)):
-        slot = next(s for s in store.load_slots() if s.name == name)
-        slot.status, slot.task_id = status, "t-0001"
-        store.save_slot(slot)
+    for number, (name, status) in enumerate(
+        (("scout", AgentStatus.RUNNING), ("fixer", AgentStatus.WAITING_INPUT))
+    ):
+        store.save_agent(Agent(name, f"t-000{number}", 1, status=status))
 
     line = await asyncio.to_thread(overlay.summarise, dashboard.url)
     assert "2 running" in line
-    # Singular, because one slot is not "need you".
-    assert "Friday needs you" in line
+    # Singular, because one agent is not "need you".
+    assert "fixer needs you" in line
 
 
 async def test_an_unreachable_buddy_is_a_sentence():
@@ -212,7 +209,7 @@ def test_the_page_still_talks_only_to_its_own_process():
     page = OVERLAY_PAGE.read_text()
     assert "pywebview.api.say" in page
     fetched = set(re.findall(r'fetch\("([^"]+)"', page))
-    assert fetched == {"/api/slots", "/api/tasks?state=queued&limit=100", "/api/brainstorm"}
+    assert fetched == {"/api/agents", "/api/tasks?state=queued&limit=100", "/api/brainstorm"}
 
 
 def test_saying_nothing_is_refused_without_opening_anything(tmp_path):

@@ -62,6 +62,13 @@ def as_int(value: object, *, key: str, default: int | None = None) -> int:
         raise ConfigError(f"{key}: {value!r} is not a whole number") from exc
 
 
+def at_least(floor: int, value: int, *, key: str) -> int:
+    """`value`, or a `ConfigError` naming the key when it is below `floor`."""
+    if value < floor:
+        raise ConfigError(f"{key}: {value} is less than {floor}")
+    return value
+
+
 def as_bool(value: object, *, key: str, default: bool = False) -> bool:
     """A TOML boolean, and only a boolean.
 
@@ -206,7 +213,8 @@ def has_secret_refs(value: str) -> bool:
 
 @dataclass(frozen=True)
 class BuddySection:
-    max_concurrent: int = 7
+    #: How many agents may run at once. 0, the default, means no limit.
+    max_concurrent: int = 0
     default_priority: int = 3
     stall_timeout: timedelta = timedelta(minutes=10)
     max_runtime: timedelta = timedelta(hours=2)
@@ -221,8 +229,10 @@ class BuddySection:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BuddySection:
         return cls(
-            max_concurrent=as_int(
-                data.get("max_concurrent"), key="buddy.max_concurrent", default=7
+            max_concurrent=at_least(
+                0,
+                as_int(data.get("max_concurrent"), key="buddy.max_concurrent", default=0),
+                key="buddy.max_concurrent",
             ),
             default_priority=as_int(
                 data.get("default_priority"), key="buddy.default_priority", default=3

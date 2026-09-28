@@ -162,7 +162,8 @@ class Ticker {
 /* ------------------------------------------------------------- dashboard */
 
 function DashboardView() {
-  const slots = h("div", { class: "slots" });
+  const agents = h("div", { class: "agents" });
+  const agentsCount = h("span", { class: "count" });
   const queue = h("div", {});
   const queueCount = h("span", { class: "count" });
   const recent = h("div", {});
@@ -186,8 +187,8 @@ function DashboardView() {
     h(
       "section",
       { class: "section" },
-      h("div", { class: "section-head" }, h("h2", { text: "Slots" })),
-      slots
+      h("div", { class: "section-head" }, h("h2", { text: "Agents" }), agentsCount),
+      agents
     ),
     h(
       "section",
@@ -203,58 +204,42 @@ function DashboardView() {
     )
   );
 
-  function slotCard(slot) {
-    const status = slot.status;
-    const linked = Boolean(slot.task_id);
-    const card = h("div", {
-      class: `slot ${status} ${linked ? "linked" : ""}`,
-      style: `--status: var(--${status})`,
-    });
+  function agentCard(agent) {
+    const status = agent.status;
+    const card = h("div", { class: `agent ${status}`, style: `--status: var(--${status})` });
     card.append(
+      h("div", { class: "agent-head" }, h("span", { class: "agent-name", title: agent.name, text: agent.name }), pill(status)),
+      h("div", { class: "agent-title", text: agent.title || agent.task_id }),
       h(
         "div",
-        { class: "slot-head" },
-        h("span", { class: "slot-name", text: slot.name }),
-        pill(status)
+        { class: "agent-sub" },
+        taskLink(agent.task_id, "row-id"),
+        priority(agent.priority),
+        agent.project && h("span", { class: "tag", text: agent.project }),
+        agent.harness && h("span", { class: "tag", text: agent.harness }),
+        agent.attempt > 1 && h("span", { class: "tag", text: `attempt ${agent.attempt}` })
       )
     );
-
-    if (linked) {
-      card.append(h("div", { class: "slot-title", text: slot.title || slot.task_id }));
+    if (agent.branch) {
       card.append(
         h(
           "div",
-          { class: "slot-sub" },
-          taskLink(slot.task_id, "row-id"),
-          priority(slot.priority),
-          slot.project && h("span", { class: "tag", text: slot.project }),
-          slot.harness && h("span", { class: "tag", text: slot.harness }),
-          slot.attempt > 1 && h("span", { class: "tag", text: `attempt ${slot.attempt}` })
+          { class: "agent-sub" },
+          h("span", { class: "tag branch", title: agent.branch, text: agent.branch })
         )
       );
-      if (slot.branch) {
-        card.append(
-          h(
-            "div",
-            { class: "slot-sub" },
-            h("span", { class: "tag branch", title: slot.branch, text: slot.branch })
-          )
-        );
-      }
-      if (slot.tail) card.append(h("div", { class: "slot-tail", text: slot.tail }));
-
-      const age = h("span", { text: "-" });
-      const quiet = h("span", { text: "-" });
-      ticker.track(age, slot.age_seconds, "up ");
-      ticker.track(quiet, slot.last_output_ago_seconds, "quiet ");
-      card.append(h("div", { class: "slot-foot" }, age, slot.last_output_ago_seconds !== null && quiet));
-      card.addEventListener("click", (event) => {
-        if (event.target.closest("a")) return;
-        location.hash = `#/task/${encodeURIComponent(slot.task_id)}`;
-      });
-    } else {
-      card.append(h("div", { class: "slot-empty", text: "no task assigned" }));
     }
+    if (agent.tail) card.append(h("div", { class: "agent-tail", text: agent.tail }));
+
+    const age = h("span", { text: "-" });
+    const quiet = h("span", { text: "-" });
+    ticker.track(age, agent.age_seconds, "up ");
+    ticker.track(quiet, agent.last_output_ago_seconds, "quiet ");
+    card.append(h("div", { class: "agent-foot" }, age, agent.last_output_ago_seconds !== null && quiet));
+    card.addEventListener("click", (event) => {
+      if (event.target.closest("a")) return;
+      location.hash = `#/task/${encodeURIComponent(agent.task_id)}`;
+    });
     return card;
   }
 
@@ -282,6 +267,7 @@ function DashboardView() {
         h(
           "div",
           { class: "row-sub" },
+          h("span", { class: "agent-tag", title: task.agent, text: task.agent }),
           h("span", { text: task.project }),
           h("span", { class: "tag", text: task.harness }),
           badges
@@ -347,9 +333,9 @@ function DashboardView() {
         h(
           "div",
           { class: "row-sub" },
+          task.agent && h("span", { class: "agent-tag", title: task.agent, text: task.agent }),
           h("span", { text: task.project }),
-          task.slot && h("span", { class: "tag", text: task.slot }),
-          task.branch && h("span", { class: "tag", text: task.branch })
+          task.branch && h("span", { class: "tag branch", title: task.branch, text: task.branch })
         )
       ),
       h("div", { class: "row-right" }, priority(task.priority), pill(task.state))
@@ -357,15 +343,24 @@ function DashboardView() {
   }
 
   async function refresh() {
-    const [slotData, queued, history, storm] = await Promise.all([
-      api("/api/slots"),
+    const [agentData, queued, history, storm] = await Promise.all([
+      api("/api/agents"),
       api("/api/tasks?state=queued&limit=100"),
       api("/api/tasks?limit=15"),
       api("/api/brainstorm"),
     ]);
     ticker.reset();
     paintBrainstorm(storm);
-    slots.replaceChildren(...slotData.slots.map(slotCard));
+    const running = agentData.agents;
+    const limit = agentData.max_concurrent;
+    agentsCount.textContent = running.length
+      ? `${running.length} running${limit ? ` of ${limit}` : ""}`
+      : "";
+    agents.replaceChildren(
+      ...(running.length
+        ? running.map(agentCard)
+        : [empty("No agents running. Queued work starts here as soon as it can.")])
+    );
     queueCount.textContent = queued.tasks.length ? `${queued.tasks.length} waiting` : "";
     queue.replaceChildren(
       queued.tasks.length
@@ -530,7 +525,7 @@ function TaskView(taskId) {
       metaCell("Project", task.project),
       metaCell("Harness", task.harness),
       metaCell("Branch", data.branch),
-      metaCell("Slot", task.slot || "-"),
+      metaCell("Agent", task.agent || "-"),
       metaCell("Attempts", String(data.runs.length || task.attempt)),
       metaCell("Created", shortWhen(task.created_at), { title: when(task.created_at) }),
       latest && metaCell("Exit code", latest.exit_code === null ? "-" : String(latest.exit_code)),

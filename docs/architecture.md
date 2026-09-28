@@ -7,14 +7,14 @@ This describes the system as built, and why the parts that look surprising are t
 ## The shape
 
 You talk to a **brain** - an LLM with tools.
-It writes briefs and drives an **agent manager**, which places tasks into seven **slots**.
-Each slot is a tmux window running a coding-agent CLI inside its own git **worktree**.
+It writes briefs and drives an **agent manager**, which starts each task as a named **agent**.
+An agent is a tmux window running a coding-agent CLI inside its own git **worktree** - made when its task starts, closed when it ends, and as many of them as there is work.
 
 ```
   you ──voice/text──▶  brain  ──tools──▶  manager ──▶ tmux windows ──▶ harness CLIs
                          │                   │                              │
                          │                   ├── workspace (git worktrees, branches)
-                         │                   └── state.db (tasks, runs, slots)
+                         │                   └── state.db (tasks, runs, agents)
                          └──────────── dashboard (read-only) ◀──────────────┘
 ```
 
@@ -55,12 +55,12 @@ buddy/
   brain.py          the conversation: tools, briefs, confirmations, context
   ideation.py       brainstorming: the mode, drafts, and what launches on /go
   conflicts.py      a merge that conflicted: the fix task, and the merge hold
-  manager.py        slots, priority, dependencies, preemption, health, recovery
+  manager.py        agents and their names, priority, dependencies, preemption, health, recovery
   workspace.py      worktrees, branches, checkpoint, merge, discard
   tmux_runner.py    session and windows, respawn, pipe-pane, process-tree kill
   state.py          SQLite (WAL)
   config.py         config.toml, secret resolution, the ~/.buddy layout
-  models.py         the vocabularies: SlotStatus, TaskState, RunOutcome, events
+  models.py         the vocabularies: AgentStatus, TaskState, RunOutcome, events; agent names
   logs.py           reading pane output: ANSI stripping, tails, sentinels
   logpipe.py        the pipe-pane target: appends a pane's output, rotates it losslessly
   leaks.py          recognising secrets, before a checkpoint, a merge or a commit
@@ -91,7 +91,7 @@ This single property is why several other things are safe:
 - `buddy diff` and `buddy merge` work after the worktree is gone - both operate on your own checkout and the branch name.
 - A resumed attempt reattaches the existing branch and continues from its last checkpoint.
 
-A project that is not a git repository has no worktree, so it takes a slot exclusively and agents run in place, one at a time.
+A project that is not a git repository has no worktree, so its agents run in place, one at a time.
 
 ### 2. A dead pane is the completion signal
 
@@ -99,13 +99,15 @@ Windows are created with `remain-on-exit on`, so a finished process leaves a **d
 Polling `#{pane_dead}` and `#{pane_dead_status}` is how Buddy knows a task ended, and the status survives Buddy being dead at the time.
 
 The wrapper script also writes `__BUDDY_START__` and `__BUDDY_DONE__` sentinels carrying the task id and exit code.
-Those are a **redundant record, never the signal** - and they are matched on task id, because a window is reused across tasks and a previous occupant's sentinel must never be read as this one's.
+Those are a **redundant record, never the signal** - and they are matched on task id, because a stale line in a log must never be read as this task's.
 
 Details that only appeared against real tmux:
 
-- `respawn-window -k` with no command **re-runs the previous command**, so returning a slot to an idle shell means naming `default-shell` explicitly.
-- `#{pane_pipe}` reports that *a* pipe exists, never where it points, so a reused slot's pipe is re-opened unconditionally.
-- `display -p -t <session>:<window>` silently answers for the session's *current* window when the target does not resolve, so it can never prove a window exists. Enumerating `list-panes -s` can, and hands over all seven slots in one call.
+- A tmux session ends with its last window, and the server with its last session. So there is no window to keep and nothing to create up front: the first agent brings the session, and closing a pipe on a window that has gone - with the server gone too - is a no-op rather than an error.
+- `remain-on-exit` is set on every spawn, not only when Buddy makes the window, because a window made by hand does not have it and its exit status would be lost.
+- `#{pane_pipe}` reports that *a* pipe exists, never where it points, so a retry that reuses its window re-opens the pipe unconditionally.
+- `display -p -t <session>:<window>` silently answers for the session's *current* window when the target does not resolve, so it can never prove a window exists. Enumerating `list-panes -s` can, and hands over every agent's pane in one call.
+- Every target is `session:=name`. Without the `=`, tmux matches a prefix, and `scout` would act on `scout-2`.
 
 ### 3. Output is captured with `pipe-pane`, not scraped
 
@@ -134,27 +136,37 @@ A dependency counts as satisfied when it is `done`, or only when it is `merged` 
 
 The tick, once a second:
 
-1. Finalize any slot whose pane has died.
+1. Finalize any agent whose pane has died, and close its window.
 2. Check the health of the rest - waiting-input patterns in the tail, progress from the log growing, runtime against `max_runtime`. What grew is first offered to the adapter's `is_progress`, so a harness retrying a dead API forever is not mistaken for one working.
-3. Fill free slots from the ready set. A task whose harness cannot be built, or whose run cannot be prepared - a secret nobody stored - fails alone, before anything is created for it, rather than being retried every tick while the queue behind it waits.
-4. Propose a preemption where a queued task outranks a running one *and* stopping it would let the queued task start: capacity is `max_concurrent`, and a non-git project's lock can only be freed by that project's own task.
+3. Start every ready task there is room for - all of them, unless `max_concurrent` is set. A task whose harness cannot be built, whose checkout cannot be made, or whose run cannot be prepared - a secret nobody stored - fails alone, rather than being retried every tick while the queue behind it waits.
+4. Propose a preemption where a queued task outranks a running one *and* stopping it would let the queued task start: room is `max_concurrent`, when set, and a non-git project's lock can only be freed by that project's own agent.
 5. Once an hour, delete discarded branches past their grace - unless the branch's reflog shows it moved after the discard.
 
-**Each slot's pass is isolated.** A checkpoint that raises - a full disk, a stray `index.lock`, a repo hook `--no-verify` does not suppress - used to leave the whole tick, so the other six slots stopped being monitored until a restart.
+**Each agent's pass is isolated.** A checkpoint that raises - a full disk, a stray `index.lock`, a repo hook `--no-verify` does not suppress - used to leave the whole tick, so every other agent stopped being monitored until a restart.
+
+## Agents and their names
+
+A task carries the name of its agent from the moment it is saved: the one the user gave, checked and normalized, or one made from its title.
+The name is its tmux window's name, the handle every command takes, and what the brain calls it.
+
+- **Unique while it matters.** No two queued or running tasks share a name, enforced by a partial unique index in SQLite rather than by the manager alone, so two processes racing for one cannot both win. A finished agent's name is free.
+- **Stable across attempts.** A preempted, timed-out or interrupted task is requeued under the same name, and its next attempt gets a new window called the same thing.
+- **Resolved, not guessed.** Anything that takes an agent's name also takes a task id. A name means the live task if there is one, otherwise the latest that ran under it; names that look like task ids are refused so the two never collide.
+- **Only live agents are stored.** The `agents` table holds what is running now - its status, last output and when it last made progress. How a task ended lives on the task and its runs, so a finished agent leaves nothing to clean up.
 
 ## Recovery
 
-`reconcile()` runs before Buddy accepts any input, and handles four cases:
+`reconcile()` runs before Buddy accepts any input and looks at every agent the database says is running.
+It never creates a window: a window that is missing is evidence, and recreating one would put a fresh shell where the task used to be.
 
 | Found | Done |
 |---|---|
+| Run **already has an outcome** | A crash came between ending the attempt and retiring its agent. Retire it; if the task still claims to be running, do what the outcome says - requeue, stay killed, or keep its verdict. |
 | Pane alive, run unfinished | Resume monitoring; re-open the log pipe if needed |
-| Pane dead | Finalize from its exit status |
-| Window or session gone | Read the log's sentinels, checkpoint, requeue |
-| Pane alive, run **already finished** | An idle shell left by a crash between `kill` and the database write. Recover the bookkeeping. |
+| Pane dead | Finalize from its exit status, and close the window |
+| Window or session gone | Read the log's sentinels: finalize if they say it finished, otherwise checkpoint and requeue |
 
-Pane state is snapshotted **before** the session is ensured, which looks backwards and is not.
-It has to be: recreating a missing window puts a fresh live shell in it, and a fresh shell is indistinguishable from a task still running.
+The writes that end an attempt - the run's outcome, the task's state and the agent's row - go in one transaction, so a crash leaves either all of them or none.
 
 ## The brain
 
@@ -183,7 +195,7 @@ Two boundaries exist because of it:
 
 | Layer | What |
 |---|---|
-| 0 | Slot and task state re-read from SQLite into the system-prompt region every turn, so it is never stale and never remembered |
+| 0 | Running agents and task state re-read from SQLite into the system-prompt region every turn, so it is never stale and never remembered |
 | 1 | Tool results truncated at ingestion, plus server-side tool-result clearing where the provider has it |
 | 1b | The client-side equivalent |
 | 2 | Server-side compaction, with the summary persisted |
@@ -203,7 +215,7 @@ Each adapter carries its own defaults - binary, verified command line, waiting p
 | `preflight()` | Does the CLI run headless, take a long prompt, auto-approve, and exit non-zero on failure - read from its own `--help`? And is it signed in, asked as cheaply as the CLI allows? |
 | `invocation()` | The exact command line, placeholders filled and quoted. |
 | `parse_result()` | The harness's own verdict and final message, from its JSON events. The exit code still decides; a disagreement is recorded. |
-| `describe_activity()`, `is_progress()` | Sentences for a slot card, and whether new output is work or retry chatter. |
+| `describe_activity()`, `is_progress()` | Sentences for an agent's card, and whether new output is work or retry chatter. |
 
 `stream.py` gets JSON objects out of a pane log - escapes, sentinels and stderr lines included - once, for all four.
 Everything each adapter knows about its CLI was found by running it; its module docstring says what, and against which version.
@@ -248,12 +260,12 @@ Each of these looks like it could be simpler, and each was simpler once.
 
 | Area | Decision, and why |
 |---|---|
-| Harness preflight | `preflight()` is `async`: it runs `<harness> --help`, and nothing may block the loop that supervises seven agents |
+| Harness preflight | `preflight()` is `async`: it runs `<harness> --help`, and nothing may block the loop that supervises every agent |
 | Command templates | Only their four placeholders are substituted; `str.format` raised on every other brace, which ordinary shell lines are full of |
 | Sandbox mounts | The brief is mounted read-only beside the worktree - it lives outside it, and a container with only the worktree cannot read it |
 | Sandbox and git | The git directory the container gets, and the identity it commits as, come from the project's own checkout, never from the worktree's `.git`, which the agent can rewrite to name any directory on your machine |
 | Git after an agent | Git on the host in a task's worktree runs pinned to the repository's own `.git`, and not at all if the worktree's pointers no longer lead back to it: config there can name a command git runs |
-| Reconcile | Pane state is snapshotted *before* the session is ensured, or the case it exists for cannot be detected |
+| Reconcile | A missing window is never recreated before it is read: a fresh shell is indistinguishable from a task still running |
 | Log capture | `pipe-pane` feeds a rotating writer rather than `cat >>`, because swapping the writer to rotate loses output |
 | Run scripts | `run.sh` is created mode `0600` and deleted the moment an attempt ends, however it ends, because it holds resolved keys |
 | Merging and discarding | Both are refused while the task's agent is still running: both remove the worktree it is working in |

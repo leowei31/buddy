@@ -50,7 +50,7 @@ COMPACT_EDIT = "compact_20260112"
 DEFAULT_MODEL = "claude-opus-5"
 
 #: Models that accept an operator instruction inside `messages` rather than
-#: only in the top-level `system` field. That is where Layer 0's fresh slot
+#: only in the top-level `system` field. That is where Layer 0's fresh agent
 #: table belongs: putting volatile state in `system` would invalidate the
 #: cached prefix on every single turn.
 MID_CONVERSATION_SYSTEM_MODELS = (

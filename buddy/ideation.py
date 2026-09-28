@@ -70,9 +70,12 @@ class Draft:
     priority: int = 0
     #: Draft ids (`d1`) or existing task ids (`t-0042`) this one builds on.
     after: list[str] = field(default_factory=list)
+    #: What its agent will be called; empty to name it from the title.
+    name: str = ""
 
     def line(self) -> str:
-        parts = [f"{self.id}  {self.title}  ({self.project}"]
+        named = f"{self.name}: " if self.name else ""
+        parts = [f"{self.id}  {named}{self.title}  ({self.project}"]
         if self.harness:
             parts.append(f", {self.harness}")
         if self.priority:

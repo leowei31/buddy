@@ -73,7 +73,7 @@ def make_run(checkout, task: TaskSpec, attempt: int = 1) -> TaskRun:
     return TaskRun(
         task_id=task.id,
         attempt=attempt,
-        slot="Tuesday",
+        agent="scout",
         worktree=checkout.path,
         branch=checkout.branch or "",
         base_ref=checkout.base_ref,
@@ -121,7 +121,7 @@ async def test_create_makes_a_worktree_on_its_own_branch(workspace: Workspace, r
     assert await workspace.current_branch(repo) == "main"
 
 
-async def test_seven_tasks_on_one_repo_do_not_collide(workspace: Workspace):
+async def test_many_tasks_on_one_repo_do_not_collide(workspace: Workspace):
     checkouts = [
         await workspace.create(make_task(id=f"t-000{i}", title=f"task {i}")) for i in range(1, 8)
     ]
@@ -146,15 +146,15 @@ async def test_create_is_idempotent_so_a_requeued_attempt_resumes(workspace: Wor
     assert (second.path / "partial.txt").read_text() == "half-done\n"
 
 
-async def test_a_non_git_project_runs_in_place_and_takes_the_slot_lock(
+async def test_a_non_git_project_runs_in_place_one_agent_at_a_time(
     workspace: Workspace, tmp_path: Path
 ):
     checkout = await workspace.create(make_task(project="notes"))
     assert not checkout.is_worktree
     assert checkout.path == tmp_path / "notes"
     assert checkout.branch is None
-    assert await workspace.requires_exclusive_slot("notes") is True
-    assert await workspace.requires_exclusive_slot("webapp") is False
+    assert await workspace.requires_exclusive_run("notes") is True
+    assert await workspace.requires_exclusive_run("webapp") is False
 
 
 async def test_a_missing_project_path_is_reported(config: Config, tmp_path: Path):

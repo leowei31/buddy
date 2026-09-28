@@ -184,7 +184,7 @@ def _error_message(error: object) -> str:
 
 
 def describe_events(log_text: str, limit: int = 20) -> list[str]:
-    """OpenCode's JSON events as sentences for a slot card."""
+    """OpenCode's JSON events as sentences for an agent card."""
     described: list[str] = []
     for event in stream.events(log_text):
         if isinstance(event, str):

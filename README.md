@@ -1,15 +1,15 @@
 # Buddy
 
-**Run seven coding agents at once, and talk to the thing that manages them.**
+**Run as many coding agents as you like at once, and talk to the thing that manages them.**
 
-Buddy gives you seven named slots - Monday through Sunday.
-Each is a tmux window running a coding-agent CLI inside its own git worktree, on its own branch.
-You say what you want; Buddy writes the brief, picks a slot, watches for stalls, and tells you when something needs you.
+Every agent has a name - one you give it, or one Buddy makes from its task - and runs in its own tmux window, inside its own git worktree, on its own branch.
+You say what you want; Buddy writes the brief, starts an agent, watches for stalls, and tells you when something needs you.
 
 ```
-you>   add rate limiting to the API, and once that's in, update the docs for it
+you>   put an agent called limiter on rate limiting the API, and once that's
+       in, update the docs for it
 
-buddy> Monday is on the rate limiting - t-0007, priority 2, on
+buddy> limiter is on the rate limiting - t-0007, priority 2, on
        buddy/t-0007-add-rate-limiting. The docs task is queued behind it and
        starts when that one merges.
 ```
@@ -29,7 +29,7 @@ It works, it is tested, and its rough edges are written down rather than hidden 
 **Before you start, know that:**
 
 - **Agents run with permissions bypassed.** That is what "unattended" means. The boundary is the git worktree and branch, with a container as an optional second one - see [sandboxing](#sandboxing).
-- **It costs money.** Every slot is a real coding-agent run, and the orchestrator itself calls an LLM API on top of that. Seven at once is seven bills.
+- **It costs money.** Every agent is a real coding-agent run, and the orchestrator itself calls an LLM API on top of that. Ten at once is ten bills - `max_concurrent` [caps it](docs/configuration.md#buddy) if you want a ceiling.
 - **macOS and Linux only.** Windows is out of scope because tmux is; WSL2 works and counts as Linux.
 
 ## What you need
@@ -97,7 +97,7 @@ Then, in order:
 4. `buddy diff t-0001`, then `buddy merge t-0001`.
 
 That round trip - spawn, watch, review, merge - is the whole product.
-Run one agent before you run seven.
+Run one agent before you run ten.
 
 ## Think first, then hand it over
 
@@ -114,10 +114,11 @@ See [brainstorming first](docs/operating.md#brainstorming-first).
 buddy                         # the interactive session, plus the dashboard on :4321
 buddy --no-voice --no-web     # typed only, no dashboard
 buddy doctor                  # every dependency, with the fix for each failure
-buddy status                  # slots sorted by priority, then the queue
-buddy spawn <project> "<brief>" [--priority N] [--after t-0141]
-buddy watch <slot>            # attach to that slot's tmux window, read-only
-buddy logs <slot|task_id> -f
+buddy status                  # running agents by priority, then the queue
+buddy spawn <project> "<brief>" [--name scout] [--priority N] [--after t-0141]
+buddy watch <agent>           # attach to that agent's tmux window, read-only
+buddy logs <agent|task_id> -f
+buddy kill <agent>            # stop it; its work is checkpointed, the task is not retried
 buddy diff <task_id>          # against the base branch
 buddy merge <task_id>         # --no-ff, deliberate, never automatic
 buddy resolve <task_id>       # a merge conflicted: an agent resolves it on top of that work
@@ -141,10 +142,10 @@ A task that was mid-flight is checkpointed and **requeued**, so it resumes from 
 
 ## The dashboard and the overlay
 
-`http://127.0.0.1:4321` shows the seven slot cards, the queue with its dependency badges, each task's live log with its colours intact, and the conversation.
+`http://127.0.0.1:4321` shows a card for every running agent, the queue with its dependency badges, each task's live log with its colours intact, and the conversation.
 It is **read-only by design**: opening, closing or refreshing the tab cannot affect a running task.
 
-`buddy overlay` is a small always-on-top panel for the corner of your screen - each busy slot, what it is doing right now, and an amber header the moment something needs you.
+`buddy overlay` is a small always-on-top panel for the corner of your screen - each running agent, what it is doing right now, and an amber header the moment something needs you.
 Type in the box at the bottom to talk to Buddy without leaving what you are doing.
 `buddy overlay --toggle` shows and hides it; point a keyboard shortcut at that.
 
@@ -210,7 +211,7 @@ The full list is in [docs/operating.md](docs/operating.md#known-gaps).
 
 | | |
 |---|---|
-| [docs/operating.md](docs/operating.md) | Day to day: the commands, the slot table, the dashboard, troubleshooting |
+| [docs/operating.md](docs/operating.md) | Day to day: the commands, naming agents, the dashboard, troubleshooting |
 | [docs/configuration.md](docs/configuration.md) | Every `config.toml` key, its real default, and what it changes |
 | [docs/architecture.md](docs/architecture.md) | How it actually works, and the decisions behind it |
 | [docs/development.md](docs/development.md) | Testing, adding a harness or a provider, the conventions |

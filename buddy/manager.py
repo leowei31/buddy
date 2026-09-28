@@ -1,4 +1,4 @@
-"""AgentManager: slots, priority heap, deps, preemption, health.
+"""AgentManager: named agents, priority, deps, preemption, health.
 
 Also the parts a single task needs to run: composing the prompt Buddy sends,
 and generating the per-task wrapper script.
@@ -32,14 +32,14 @@ from buddy.config import (
 )
 from buddy.logs import DONE_SENTINEL, START_SENTINEL, read_sentinels, read_tail, tail
 from buddy.models import (
-    SLOT_NAMES,
-    AgentSlot,
+    Agent,
+    AgentHealthChanged,
+    AgentNameError,
+    AgentStatus,
     BranchDeleted,
     Event,
     PreemptionProposal,
     RunOutcome,
-    SlotHealthChanged,
-    SlotStatus,
     TaskBlocked,
     TaskFinished,
     TaskRequeued,
@@ -47,6 +47,8 @@ from buddy.models import (
     TaskSpec,
     TaskStarted,
     TaskState,
+    check_agent_name,
+    default_agent_name,
     utcnow,
 )
 from buddy.sandbox import wrap_in_sandbox
@@ -73,7 +75,7 @@ WORKING_RULES = (
 )
 
 #: The same block for a project that is not a git repo, where there is no
-#: branch and the task runs in place under a one-slot lock.
+#: branch and the task runs in place, one agent at a time.
 WORKING_RULES_NO_GIT = (
     "## Working rules\n"
     "- You are working directly in {worktree}, which is not a git repository,"
@@ -313,7 +315,7 @@ async def finalize_run(
     matters: the run script goes first and the checkpoint next, so neither a
     secret nor the work is lost if the rest fails.
     """
-    await runner.close_pipe(run.slot)
+    await runner.close_pipe(run.agent)
     # First, not last: the pane is dead, so nothing needs the script, and a
     # checkpoint that raises below must not leave resolved secrets behind.
     remove_run_script(config.paths.run_script(task.id))
@@ -360,18 +362,9 @@ async def finalize_run(
             task.id, TaskState.DONE if resolved is RunOutcome.DONE else TaskState.ERROR
         )
 
-    slots = {slot.name: slot for slot in store.load_slots()}
-    slot = slots.get(run.slot)
-    if slot:
-        slot.status = SlotStatus.DONE if resolved is RunOutcome.DONE else SlotStatus.ERROR
-        slot.last_output = describe_activity(
-            adapter, read_tail(run.log_path, lines=80, clean=False), 20
-        )
-        store.save_slot(slot)
-
     return TaskFinished(
         task_id=task.id,
-        slot=run.slot,
+        agent=run.agent,
         attempt=run.attempt,
         outcome=resolved,
         exit_code=exit_code,
@@ -413,7 +406,12 @@ class _Pending:
 
 
 class AgentManager:
-    """Slots, priority heap, dependencies, preemption, health.
+    """Named agents, priority, dependencies, preemption, health.
+
+    An agent is a task while it runs, under the name the user calls it by:
+    its own tmux window, created when the attempt starts and removed when it
+    ends. There is no fixed number of them. `max_concurrent` can cap how
+    many run at once; unset, anything ready starts.
 
     Knows the harness *protocol* but never a harness: adapters arrive
     through `adapter_for`, which is why adding a fifth harness does not touch
@@ -422,8 +420,6 @@ class AgentManager:
     `now` is injected so stall and timeout behaviour can be tested without
     waiting ten real minutes.
     """
-
-    MAX_CONCURRENT = 7
 
     def __init__(
         self,
@@ -447,54 +443,66 @@ class AgentManager:
         #: Dropped proposals and why, so a late yes gets a reason, not a KeyError.
         self._stale: dict[str, str] = {}
         self._last_sweep: datetime | None = None
-        #: Last observed log size per slot, which is how `last_output_at` is
+        #: Last observed log size per agent, which is how `last_output_at` is
         #: maintained: the file growing, not a capture-pane diff.
         self._log_sizes: dict[str, int] = {}
         #: Tasks already reported as blocked, so the brain hears it once.
         self._reported_blocked: set[str] = set()
-        #: Which projects are not git repos and so take a slot exclusively.
+        #: Which projects are not git repos and so run one agent at a time.
         #: Filled by `refresh_project_locks`.
         self._exclusive: dict[str, bool] = {}
 
     @property
-    def max_concurrent(self) -> int:
-        return min(self.config.buddy.max_concurrent, len(SLOT_NAMES))
+    def max_concurrent(self) -> int | None:
+        """How many agents may run at once, or None for no limit."""
+        return self.config.buddy.max_concurrent or None
 
-    # -- slot bookkeeping --------------------------------------------------
+    def _has_room(self, active: list[Agent]) -> bool:
+        limit = self.max_concurrent
+        return limit is None or len(active) < limit
 
-    def slots(self) -> list[AgentSlot]:
-        return self.store.ensure_slots()
+    # -- agents ------------------------------------------------------------
 
-    def _slot(self, name: str) -> AgentSlot:
-        for slot in self.slots():
-            if slot.name == name:
-                return slot
-        raise KeyError(f"no such slot: {name}")
+    def agents(self) -> list[Agent]:
+        """Every running agent, most urgent first."""
+        return self.store.load_agents()
 
-    def _free_slots(self, slots: list[AgentSlot]) -> list[AgentSlot]:
-        """Free slots, idle ones first.
+    def agent(self, name: str) -> Agent | None:
+        """The running agent with this name, whatever its case."""
+        return self.store.get_agent(name)
 
-        A finished slot still shows its last task's output until it is reused,
-        so taking a genuinely idle slot first keeps that output readable for
-        longer.
+    def claim_name(self, requested: str, title: str) -> str:
+        """The name a new task's agent will have.
+
+        What the user asked for, checked and normalized - or, when they did
+        not say, one made from the title. Either way it is not the name of
+        another queued or running agent: a name is a handle, and "kill
+        scout" must mean exactly one thing. A finished agent's name is free.
         """
-        order = {name: index for index, name in enumerate(SLOT_NAMES)}
-        free = [slot for slot in slots if not slot.status.is_occupied]
-        return sorted(free, key=lambda s: (s.status is not SlotStatus.IDLE, order[s.name]))
+        taken = self.store.live_agent_names()
+        if not requested.strip():
+            return default_agent_name(title, taken)
+        name = check_agent_name(requested)
+        holder = taken.get(name.lower())
+        if holder is not None:
+            state = self.store.get_task_state(holder)
+            raise AgentNameError(
+                f"{name} is already {holder}, which is {state.value if state else 'live'}. "
+                "Pick another name, or wait for it to finish."
+            )
+        return name
 
-    def _occupied(self, slots: list[AgentSlot]) -> list[AgentSlot]:
-        return [slot for slot in slots if slot.status.is_occupied]
+    async def _retire(self, agent: Agent) -> None:
+        """An attempt is over: its window and its row go.
 
-    def _clear_slot(self, slot: AgentSlot, status: SlotStatus) -> None:
-        slot.status = status
-        slot.task_id = None
-        slot.run_attempt = None
-        slot.harness = None
-        slot.priority = None
-        slot.started_at = None
-        slot.last_output_at = None
-        self._log_sizes.pop(slot.name, None)
-        self.store.save_slot(slot)
+        The window is closed before the row is removed, so a crash between
+        the two leaves a row with no window - which reconciliation recovers
+        from the run's outcome - rather than a window nothing tracks.
+        """
+        await self.runner.close_window(agent.name)
+        remove_run_script(self.config.paths.run_script(agent.task_id))
+        self.store.remove_agent(agent.name)
+        self._log_sizes.pop(agent.name, None)
 
     # -- dependencies ----------------------------------------------
 
@@ -540,7 +548,12 @@ class AgentManager:
     # -- submitting and scheduling ---------------------------------
 
     async def submit(self, task: TaskSpec) -> list[Event]:
-        """Persist the task as queued, then schedule."""
+        """Name the task's agent, persist the task as queued, then schedule.
+
+        Raises `AgentNameError`, before anything is saved, for a name that
+        cannot be used.
+        """
+        task.agent = self.claim_name(task.agent, task.title)
         self.store.create_task(task, TaskState.QUEUED)
         return await self.schedule()
 
@@ -553,42 +566,36 @@ class AgentManager:
         return len(self.ready_tasks())
 
     async def schedule(self) -> list[Event]:
-        """Fill free slots from the ready set; propose a preemption if the
-         top ready task outranks something running. Never preempts on its own
-        ."""
-        await self.runner.ensure_session()
+        """Start every ready task there is room for; propose a preemption if
+        the top ready task outranks something running and cannot start
+        otherwise. Never preempts on its own."""
         await self.refresh_project_locks()
         events: list[Event] = []
-        slots = self.slots()
 
         while True:
-            ready = self.ready_tasks()
-            if not ready:
+            active = self.agents()
+            if not self._has_room(active):
                 break
-            free = self._free_slots(slots)
-            if not free or len(self._occupied(slots)) >= self.max_concurrent:
-                break
-            task = self._next_schedulable(ready, slots)
+            task = self._next_schedulable(self.ready_tasks(), active)
             if task is None:
                 break
-            events.append(await self._start(task, free[0]))
-            slots = self.slots()
+            events.append(await self._start(task))
 
         events.extend(self._report_blocked())
-        events.extend(await self._maybe_propose_preemption(slots))
+        events.extend(await self._maybe_propose_preemption(self.agents()))
         return events
 
-    def _next_schedulable(self, ready: list[TaskSpec], slots: list[AgentSlot]) -> TaskSpec | None:
+    def _next_schedulable(self, ready: list[TaskSpec], active: list[Agent]) -> TaskSpec | None:
         """The highest-ranked ready task that can actually start now.
 
-        A non-git project takes an exclusive slot, so a task for one is
+        A non-git project runs one agent at a time, so a task for one is
         skipped while another task in that project is running rather than
         blocking everything behind it.
         """
         busy_projects = {
-            slot_task.project
-            for slot in self._occupied(slots)
-            if slot.task_id and (slot_task := self.store.get_task(slot.task_id))
+            running.project
+            for agent in active
+            if (running := self.store.get_task(agent.task_id)) is not None
         }
         for task in ready:
             if task.project in busy_projects and self._exclusive.get(task.project):
@@ -597,12 +604,12 @@ class AgentManager:
         return None
 
     async def refresh_project_locks(self) -> None:
-        """Which projects are not git repos, and so take one slot at a time.
+        """Which projects are not git repos, and so run one agent at a time.
         Cached: it cannot change while Buddy runs without someone
         running `git init` underneath it."""
         for name in self.config.projects:
             if name not in self._exclusive:
-                self._exclusive[name] = await self.workspace.requires_exclusive_slot(name)
+                self._exclusive[name] = await self.workspace.requires_exclusive_run(name)
 
     def _refusal(self, task: TaskSpec) -> str | None:
         """Why this task can never start, or None if it can.
@@ -627,13 +634,14 @@ class AgentManager:
         return TaskFinished(
             at=self.now(),
             task_id=task.id,
+            agent=task.agent,
             attempt=task.attempt,
             outcome=RunOutcome.ERROR,
             summary=f"could not start: {reason}",
         )
 
-    async def _start(self, task: TaskSpec, slot: AgentSlot) -> Event:
-        """Worktree, prompt, wrapper, pane."""
+    async def _start(self, task: TaskSpec) -> Event:
+        """Worktree, prompt, wrapper, and a window of its own."""
         refusal = self._refusal(task)
         if refusal is not None:
             return self._refuse(task, refusal)
@@ -650,7 +658,7 @@ class AgentManager:
         run = TaskRun(
             task_id=task.id,
             attempt=task.attempt,
-            slot=slot.name,
+            agent=task.agent,
             worktree=checkout.path,
             branch=checkout.branch or "",
             base_ref=checkout.base_ref,
@@ -672,20 +680,28 @@ class AgentManager:
             self.store.create_run(run)
         else:
             self.store.save_run(run)
-        await self.runner.spawn(slot.name, run, script)
+        try:
+            await self.runner.spawn(task.agent, run, script)
+        except BaseException:
+            # The task stays queued and is tried again on a later tick; its
+            # resolved secrets do not wait on disk for that.
+            remove_run_script(script)
+            raise
 
-        slot.status = SlotStatus.RUNNING
-        slot.task_id = task.id
-        slot.run_attempt = run.attempt
-        slot.harness = task.harness
-        slot.priority = task.priority
-        slot.started_at = run.started_at
-        slot.last_output_at = run.started_at
-        slot.last_output = ""
-        self.store.save_slot(slot)
-        self.store.set_task_state(task.id, TaskState.RUNNING)
-        self._log_sizes[slot.name] = 0
-        return TaskStarted(at=self.now(), task_id=task.id, slot=slot.name, attempt=run.attempt)
+        agent = Agent(
+            name=task.agent,
+            task_id=task.id,
+            run_attempt=run.attempt,
+            harness=task.harness,
+            priority=task.priority,
+            started_at=run.started_at,
+            last_output_at=run.started_at,
+        )
+        with self.store.transaction():
+            self.store.save_agent(agent)
+            self.store.set_task_state(task.id, TaskState.RUNNING)
+        self._log_sizes[agent.name] = 0
+        return TaskStarted(at=self.now(), task_id=task.id, agent=agent.name, attempt=run.attempt)
 
     def _report_blocked(self) -> list[Event]:
         events: list[Event] = []
@@ -698,74 +714,70 @@ class AgentManager:
 
     # -- preemption -------------------------------------------------
 
-    async def _maybe_propose_preemption(self, slots: list[AgentSlot]) -> list[Event]:
+    async def _maybe_propose_preemption(self, active: list[Agent]) -> list[Event]:
         """Propose stopping a running task for a queued one that outranks it
         - but only a stop that would actually let it start.
 
-        Two things decide that. Capacity is `max_concurrent`, not idle slots:
-        with a limit of two, five slots are always idle, and treating any idle
-        slot as room meant no preemption was ever proposed under a limit. And
-        a non-git project runs one task at a time: a queued task for
-        it can only start once *that* project's task stops, so it is the only
-        victim that helps. A stop that frees nothing for the task
-        is never proposed, because the scheduler would put the victim
-        straight back.
+        Two things can hold a ready task back, and so two things decide that.
+        One is `max_concurrent`, when it is set: stopping any lower-ranked
+        agent makes room. The other is a non-git project, which runs one
+        agent at a time: a queued task for it can only start once *that*
+        project's agent stops, so it is the only victim that helps. A stop
+        that frees nothing for the task is never proposed, because the
+        scheduler would put the victim straight back.
         """
-        self._drop_stale_proposals(slots)
-        occupied = self._occupied(slots)
-        if not occupied:
+        self._drop_stale_proposals(active)
+        if not active:
             return []
-        promised = {p.proposal.victim_slot for p in self._pending.values()}
+        promised = {p.proposal.victim_agent.lower() for p in self._pending.values()}
         for incoming in self.ready_tasks():
             if any(p.proposal.incoming_task_id == incoming.id for p in self._pending.values()):
                 return []  # one question at a time about the same task
             victims = [
-                slot
-                for slot in occupied
-                if slot.name not in promised
-                and slot.priority is not None
-                and incoming.priority < slot.priority
-                and self._would_start_without(incoming, slot, slots)
+                agent
+                for agent in active
+                if agent.name.lower() not in promised
+                and agent.priority is not None
+                and incoming.priority < agent.priority
+                and self._would_start_without(incoming, agent, active)
             ]
             if not victims:
                 continue
-            victim = max(victims, key=lambda s: (s.priority, s.started_at or datetime.min))
+            victim = max(victims, key=lambda a: (a.priority, a.started_at or datetime.min))
             proposal = PreemptionProposal(
                 at=self.now(),
                 proposal_id=f"p-{uuid.uuid4().hex[:8]}",
-                victim_slot=victim.name,
-                victim_task_id=victim.task_id or "",
+                victim_agent=victim.name,
+                victim_task_id=victim.task_id,
                 incoming_task_id=incoming.id,
             )
             self._pending[proposal.proposal_id] = _Pending(proposal, incoming)
             return [proposal]
         return []
 
-    def _would_start_without(
-        self, incoming: TaskSpec, victim: AgentSlot, slots: list[AgentSlot]
-    ) -> bool:
+    def _would_start_without(self, incoming: TaskSpec, victim: Agent, active: list[Agent]) -> bool:
         """Whether `incoming` could start if `victim` stopped."""
-        others = [s for s in self._occupied(slots) if s.name != victim.name]
-        if len(others) >= self.max_concurrent:
+        others = [a for a in active if a.name != victim.name]
+        if not self._has_room(others):
             return False
         if self._exclusive.get(incoming.project):
-            for slot in others:
-                running = self.store.get_task(slot.task_id) if slot.task_id else None
+            for agent in others:
+                running = self.store.get_task(agent.task_id)
                 if running is not None and running.project == incoming.project:
                     return False
         return True
 
-    def _drop_stale_proposals(self, slots: list[AgentSlot]) -> None:
-        """A proposal whose victim left its slot, or whose incoming task is no
+    def _drop_stale_proposals(self, active: list[Agent]) -> None:
+        """A proposal whose victim stopped, or whose incoming task is no
         longer waiting, is a question with no subject any more."""
-        by_name = {slot.name: slot for slot in slots}
+        by_name = {agent.name.lower(): agent for agent in active}
         for key, pending in list(self._pending.items()):
-            slot = by_name.get(pending.proposal.victim_slot)
-            still_there = slot is not None and slot.task_id == pending.proposal.victim_task_id
+            agent = by_name.get(pending.proposal.victim_agent.lower())
+            still_there = agent is not None and agent.task_id == pending.proposal.victim_task_id
             waiting = self.store.get_task_state(pending.incoming.id) is TaskState.QUEUED
             if not still_there:
                 self._stale[key] = (
-                    f"{pending.proposal.victim_slot} is no longer running "
+                    f"{pending.proposal.victim_agent} is no longer running "
                     f"{pending.proposal.victim_task_id}, so nothing was stopped"
                 )
             elif not waiting:
@@ -786,8 +798,8 @@ class AgentManager:
         return {key: value.proposal for key, value in self._pending.items()}
 
     async def accept_preemption(self, proposal_id: str) -> list[Event]:
-        """Kill, checkpoint, keep the branch, requeue, then fill the slot.
-        Only ever called after the user says yes."""
+        """Kill, checkpoint, keep the branch, requeue, then start the task it
+        was stopped for. Only ever called after the user says yes."""
         pending = self._pending.pop(proposal_id, None)
         if pending is None:
             if reason := self._stale.pop(proposal_id, None):
@@ -796,12 +808,12 @@ class AgentManager:
 
         proposal = pending.proposal
         victim_task = self.store.get_task(proposal.victim_task_id)
-        slot = self._slot(proposal.victim_slot)
-        if victim_task is None or slot.task_id != victim_task.id:
+        victim = self.agent(proposal.victim_agent)
+        if victim_task is None or victim is None or victim.task_id != victim_task.id:
             # The victim finished, was killed, or was preempted already. Saying
             # "preempted" here would be a lie about work that was never stopped.
             raise StalePreemption(
-                f"{proposal.victim_slot} is no longer running {proposal.victim_task_id}, "
+                f"{proposal.victim_agent} is no longer running {proposal.victim_task_id}, "
                 "so nothing was stopped"
             )
         if self.store.get_task_state(pending.incoming.id) is not TaskState.QUEUED:
@@ -810,12 +822,12 @@ class AgentManager:
             )
 
         events: list[Event] = []
-        events.extend(await self._stop_and_requeue(slot, victim_task, RunOutcome.PREEMPTED))
-        # The freed slot goes to the task it was freed for - not to whatever a
-        # fresh scheduling pass would pick, which could be the victim itself.
+        events.extend(await self._stop_and_requeue(victim, victim_task, RunOutcome.PREEMPTED))
+        # The room goes to the task it was made for - not to whatever a fresh
+        # scheduling pass would pick, which could be the victim itself.
         incoming = self.store.get_task(pending.incoming.id)
         if incoming is not None and self.dependency_block(incoming) is None:
-            events.append(await self._start(incoming, self._slot(proposal.victim_slot)))
+            events.append(await self._start(incoming))
         events.extend(await self.schedule())
         return events
 
@@ -823,72 +835,77 @@ class AgentManager:
         self._pending.pop(proposal_id, None)
 
     async def _stop_and_requeue(
-        self, slot: AgentSlot, task: TaskSpec, outcome: RunOutcome
+        self, agent: Agent, task: TaskSpec, outcome: RunOutcome
     ) -> list[Event]:
         """The shared path for preempt, timeout and interrupt.
 
         Nothing is discarded: the worktree and branch are kept, whatever was
         uncommitted is checkpointed, and the task goes back on the queue at
-        its original priority with the resume note.
+        its original priority, under the same name, with the resume note.
         """
-        run = self.store.get_run(task.id, slot.run_attempt or task.attempt)
-        await self._kill(slot.name, task.id)
+        run = self.store.get_run(task.id, agent.run_attempt)
+        await self._kill(agent.name, task.id)
         if run is not None:
             run.wip_commit = await self.workspace.checkpoint(run, outcome)
             run.ended_at = self.now()
             run.outcome = outcome
-            self.store.save_run(run)
 
         task.attempt += 1
-        self.store.update_task(task)
-        self.store.set_task_state(task.id, TaskState.QUEUED)
-        self._clear_slot(slot, SlotStatus.IDLE)
+        # One transaction: a crash can leave the attempt stopped, but never
+        # recorded as over while the task still claims to be running.
+        with self.store.transaction():
+            if run is not None:
+                self.store.save_run(run)
+            self.store.update_task(task)
+            self.store.set_task_state(task.id, TaskState.QUEUED)
+            self.store.remove_agent(agent.name)
+        self._log_sizes.pop(agent.name, None)
         return [
             TaskRequeued(at=self.now(), task_id=task.id, next_attempt=task.attempt, reason=outcome)
         ]
 
-    async def _kill(self, slot_name: str, task_id: str | None) -> None:
-        """Stop a slot's process tree, and with it the attempt's `run.sh`.
+    async def _kill(self, name: str, task_id: str | None) -> None:
+        """Stop an agent's process tree and close its window, and with them
+        the attempt's `run.sh`.
 
         Every way an attempt ends that is not its pane dying on its own -
         kill, preempt, timeout, interrupt, shutdown - comes through here, so
         none of them can leave resolved secrets on disk. A requeued
         attempt writes a fresh script when it starts again.
         """
-        await self.runner.kill(slot_name)
+        await self.runner.kill(name)
         if task_id:
             remove_run_script(self.config.paths.run_script(task_id))
 
     # -- the tick ---------------------------------------------------
 
     async def tick(self) -> list[Event]:
-        """One pass: finish what ended, check health, fill what is free."""
+        """One pass: finish what ended, check health, start what is ready."""
         await self.refresh_project_locks()
         events: list[Event] = []
         panes = await self.runner.panes()
 
-        for slot in self.slots():
-            if not slot.status.is_occupied or not slot.task_id:
-                continue
-            task = self.store.get_task(slot.task_id)
+        for agent in self.agents():
+            task = self.store.get_task(agent.task_id)
             if task is None:
+                await self._retire(agent)  # nothing it could be running
                 continue
             try:
-                events.extend(await self._tick_slot(slot, task, panes.get(slot.name)))
-            except Exception as exc:  # noqa: BLE001 - one slot, not seven
+                events.extend(await self._tick_agent(agent, task, panes.get(agent.name)))
+            except Exception as exc:  # noqa: BLE001 - one agent, not all of them
                 # A disk-full worktree, a stray index.lock, a repo hook that
                 # `--no-verify` does not suppress: any of them can make one
-                # slot's checkpoint raise. Before this, that exception left
-                # `tick` entirely, so the other six slots stopped being
+                # agent's checkpoint raise. Before this, that exception left
+                # `tick` entirely, so every other agent stopped being
                 # monitored too - no finalize, no stall detection, no
                 # scheduling - until someone restarted the process.
                 events.append(
-                    SlotHealthChanged(
+                    AgentHealthChanged(
                         at=self.now(),
-                        slot=slot.name,
+                        agent=agent.name,
                         task_id=task.id,
-                        status=slot.status,
-                        detail=f"tick failed for this slot: {type(exc).__name__}: {exc}",
+                        status=agent.status,
+                        detail=f"tick failed for this agent: {type(exc).__name__}: {exc}",
                     )
                 )
 
@@ -924,30 +941,25 @@ class AgentManager:
                     await self.workspace.prune_worktrees(name)
         return events
 
-    async def _tick_slot(self, slot: AgentSlot, task: TaskSpec, pane) -> list[Event]:
-        """One slot's pass, so a failure in it stays in it."""
-        events: list[Event] = []
+    async def _tick_agent(self, agent: Agent, task: TaskSpec, pane) -> list[Event]:
+        """One agent's pass, so a failure in it stays in it."""
         if pane is None or not pane.exists:
             # The window vanished under a running task: the restart case,
-            # reachable at runtime too if someone kills the window.
-            events.extend(await self._handle_missing_window(slot, task))
-            return events
-
+            # reachable at runtime too if someone closes the window.
+            return await self._handle_missing_window(agent, task)
         if pane.dead:
-            events.append(await self._finalize(slot, task, pane.exit_code))
-            return events
+            return [await self._finalize(agent, task, pane.exit_code)]
+        return await self._check_health(agent, task)
 
-        events.extend(await self._check_health(slot, task))
-        return events
-
-    async def _finalize(self, slot: AgentSlot, task: TaskSpec, exit_code: int | None) -> Event:
-        run = self.store.get_run(task.id, slot.run_attempt or task.attempt)
+    async def _finalize(self, agent: Agent, task: TaskSpec, exit_code: int | None) -> Event:
+        run = self.store.get_run(task.id, agent.run_attempt)
         if run is None:
-            self._clear_slot(slot, SlotStatus.ERROR)
+            self.store.set_task_state(task.id, TaskState.ERROR)
+            await self._retire(agent)
             return TaskFinished(
                 at=self.now(),
                 task_id=task.id,
-                slot=slot.name,
+                agent=agent.name,
                 outcome=RunOutcome.ERROR,
                 exit_code=exit_code,
                 summary="no run was recorded for this attempt",
@@ -962,14 +974,14 @@ class AgentManager:
             run=run,
             exit_code=exit_code if exit_code is not None else -1,
         )
-        self._log_sizes.pop(slot.name, None)
+        await self._retire(agent)
         return event
 
     # -- health -----------------------------------------------------
 
-    async def _check_health(self, slot: AgentSlot, task: TaskSpec) -> list[Event]:
+    async def _check_health(self, agent: Agent, task: TaskSpec) -> list[Event]:
         now = self.now()
-        run = self.store.get_run(task.id, slot.run_attempt or task.attempt)
+        run = self.store.get_run(task.id, agent.run_attempt)
         log_path = run.log_path if run else self.config.paths.log_file(task.id, task.attempt)
 
         adapter = self.adapter_for(task.harness)
@@ -978,13 +990,13 @@ class AgentManager:
         # offered to the adapter first, because a harness retrying a dead API
         # forever grows its log the whole time and is going nowhere.
         size = log_path.stat().st_size if log_path.exists() else 0
-        seen = self._log_sizes.get(slot.name, -1)
+        seen = self._log_sizes.get(agent.name, -1)
         if size != seen:
-            self._log_sizes[slot.name] = size
+            self._log_sizes[agent.name] = size
             if _made_progress(adapter, log_path, seen, size):
-                slot.last_output_at = now
+                agent.last_output_at = now
 
-        previous = slot.status
+        previous = agent.status
         # Unstripped: the adapter decides what its own output means, and a
         # harness that emits JSON needs the raw lines to parse.
         tail_text = read_tail(log_path, lines=80)
@@ -992,72 +1004,74 @@ class AgentManager:
             pattern.search(tail_text) for pattern in getattr(adapter, "waiting_patterns", [])
         )
 
-        started = slot.started_at or run.started_at if run else slot.started_at
+        started = agent.started_at or (run.started_at if run else None)
         if started and now - started > task.max_runtime:
-            return await self._handle_timeout(slot, task)
+            return await self._handle_timeout(agent, task)
 
         if waiting:
-            slot.status = SlotStatus.WAITING_INPUT
-        elif slot.last_output_at and now - slot.last_output_at > task.stall_timeout:
+            agent.status = AgentStatus.WAITING_INPUT
+        elif agent.last_output_at and now - agent.last_output_at > task.stall_timeout:
             # Notified, never killed: a long compile looks exactly like a hang,
             # so the decision is the user's.
-            slot.status = SlotStatus.STALLED
+            agent.status = AgentStatus.STALLED
         else:
-            slot.status = SlotStatus.RUNNING
+            agent.status = AgentStatus.RUNNING
 
-        slot.last_output = describe_activity(adapter, tail_text, 20)
-        self.store.save_slot(slot)
+        agent.last_output = describe_activity(adapter, tail_text, 20)
+        self.store.save_agent(agent)
 
-        if slot.status is previous:
+        if agent.status is previous:
             return []
         detail = {
-            SlotStatus.WAITING_INPUT: "the harness is asking for input; attach to answer it",
-            SlotStatus.STALLED: f"no progress for {task.stall_timeout}",
-            SlotStatus.RUNNING: "producing output again",
-        }.get(slot.status, "")
+            AgentStatus.WAITING_INPUT: "the harness is asking for input; attach to answer it",
+            AgentStatus.STALLED: f"no progress for {task.stall_timeout}",
+            AgentStatus.RUNNING: "producing output again",
+        }[agent.status]
         return [
-            SlotHealthChanged(
-                at=now, slot=slot.name, task_id=task.id, status=slot.status, detail=detail
+            AgentHealthChanged(
+                at=now, agent=agent.name, task_id=task.id, status=agent.status, detail=detail
             )
         ]
 
-    async def _handle_timeout(self, slot: AgentSlot, task: TaskSpec) -> list[Event]:
+    async def _handle_timeout(self, agent: Agent, task: TaskSpec) -> list[Event]:
         """Kill, checkpoint, requeue once; a second timeout is an error."""
         already_timed_out = any(
             run.outcome is RunOutcome.TIMEOUT for run in self.store.runs_for(task.id)
         )
-        if already_timed_out:
-            run = self.store.get_run(task.id, slot.run_attempt or task.attempt)
-            await self._kill(slot.name, task.id)
+        if not already_timed_out:
+            return await self._stop_and_requeue(agent, task, RunOutcome.TIMEOUT)
+        run = self.store.get_run(task.id, agent.run_attempt)
+        await self._kill(agent.name, task.id)
+        if run is not None:
+            run.wip_commit = await self.workspace.checkpoint(run, RunOutcome.TIMEOUT)
+            run.ended_at = self.now()
+            run.outcome = RunOutcome.TIMEOUT
+        with self.store.transaction():
             if run is not None:
-                run.wip_commit = await self.workspace.checkpoint(run, RunOutcome.TIMEOUT)
-                run.ended_at = self.now()
-                run.outcome = RunOutcome.TIMEOUT
                 self.store.save_run(run)
             self.store.set_task_state(task.id, TaskState.ERROR)
-            self._clear_slot(slot, SlotStatus.ERROR)
-            return [
-                TaskFinished(
-                    at=self.now(),
-                    task_id=task.id,
-                    slot=slot.name,
-                    attempt=task.attempt,
-                    outcome=RunOutcome.TIMEOUT,
-                    summary=f"timed out twice after {task.max_runtime}; not retried again",
-                )
-            ]
-        return await self._stop_and_requeue(slot, task, RunOutcome.TIMEOUT)
+            self.store.remove_agent(agent.name)
+        self._log_sizes.pop(agent.name, None)
+        return [
+            TaskFinished(
+                at=self.now(),
+                task_id=task.id,
+                agent=agent.name,
+                attempt=task.attempt,
+                outcome=RunOutcome.TIMEOUT,
+                summary=f"timed out twice after {task.max_runtime}; not retried again",
+            )
+        ]
 
-    async def _handle_missing_window(self, slot: AgentSlot, task: TaskSpec) -> list[Event]:
+    async def _handle_missing_window(self, agent: Agent, task: TaskSpec) -> list[Event]:
         """The window is gone. The log outlives it, so it decides."""
-        run = self.store.get_run(task.id, slot.run_attempt or task.attempt)
+        run = self.store.get_run(task.id, agent.run_attempt)
         log_path = run.log_path if run else self.config.paths.log_file(task.id, task.attempt)
         found = read_sentinels(log_path, task.id)
-        await self.runner.ensure_session()
         if found.finished and found.exit_code is not None:
             # It did finish; Buddy just missed the moment.
-            return [await self._finalize(slot, task, found.exit_code)]
-        return await self._stop_and_requeue(slot, task, RunOutcome.INTERRUPTED)
+            return [await self._finalize(agent, task, found.exit_code)]
+        return await self._stop_and_requeue(agent, task, RunOutcome.INTERRUPTED)
 
     # -- reconciliation --------------------------------------------
 
@@ -1067,90 +1081,73 @@ class AgentManager:
         Nothing is ever left in an unknown state, because the log file and the
         worktree survive everything short of disk loss.
         """
-        # Pane state is read *before* the session is ensured, which looks
-        # backwards. It has to be: `ensure_session` recreates a
-        # missing window with a fresh live shell in it, and a fresh shell is
-        # indistinguishable from a task still running. Snapshotting first
-        # preserves both intents - know what happened, then make sure the
-        # session is there to monitor.
         panes = await self.runner.panes()
-        await self.runner.ensure_session()
         await self.refresh_project_locks()
         events: list[Event] = []
 
-        for slot in self.slots():
-            if not slot.status.is_occupied or not slot.task_id:
-                continue
-            task = self.store.get_task(slot.task_id)
+        for agent in self.agents():
+            task = self.store.get_task(agent.task_id)
             if task is None:
-                self._clear_slot(slot, SlotStatus.IDLE)
+                await self._retire(agent)
                 continue
-            pane = panes.get(slot.name)
-            run = self.store.get_run(task.id, slot.run_attempt or task.attempt)
+            pane = panes.get(agent.name)
+            run = self.store.get_run(task.id, agent.run_attempt)
 
-            if pane is None or not pane.exists:
-                events.extend(await self._handle_missing_window(slot, task))
+            if run is not None and run.outcome is not None:
+                # This attempt already ended, and a crash came before its
+                # agent was retired. Whatever the window holds now - a dead
+                # pane, or nothing - is not the task.
+                events.extend(await self._recover_ended(agent, task, run))
+            elif pane is None or not pane.exists:
+                events.extend(await self._handle_missing_window(agent, task))
             elif pane.dead:
-                events.append(await self._finalize(slot, task, pane.exit_code))
-            elif run is not None and run.outcome is not None:
-                # Alive, but this attempt already ended. That combination is
-                # only reachable one way: `kill` respawns the window into a
-                # fresh idle shell *before* the outcome, the task state and
-                # the slot are written, so a crash between those steps leaves
-                # a live shell that looks exactly like a running task. The
-                # slot would then be held forever - the pane never dies, so
-                # nothing ever finalizes it, and `_orphaned_runs` cannot see
-                # it either because the outcome was already written.
-                #
-                # An idle shell is not the task. Put the task back.
-                events.extend(await self._resume_after_kill(slot, task, run))
+                events.append(await self._finalize(agent, task, pane.exit_code))
             else:
                 # Alive: resume monitoring, and make sure the log pipe is open
                 # so the next tick's stall detection has something to read.
                 if run is not None and not pane.piped:
-                    await self.runner.open_pipe(slot.name, run.log_path)
+                    await self.runner.open_pipe(agent.name, run.log_path)
                 if run is not None and run.log_path.exists():
-                    self._log_sizes[slot.name] = run.log_path.stat().st_size
+                    self._log_sizes[agent.name] = run.log_path.stat().st_size
 
-        # Any run left with no outcome whose slot no longer claims it was
-        # interrupted between the pane ending and the row being written.
+        # Any run left with no outcome that no agent claims was interrupted
+        # between the pane ending and the row being written.
         events.extend(self._orphaned_runs())
         return events
 
-    async def _resume_after_kill(
-        self, slot: AgentSlot, task: TaskSpec, run: TaskRun
-    ) -> list[Event]:
+    async def _recover_ended(self, agent: Agent, task: TaskSpec, run: TaskRun) -> list[Event]:
         """Finish the bookkeeping a crash interrupted.
 
         The work itself is safe either way: whatever the attempt produced was
         already checkpointed onto its branch before the outcome was written.
-        What is left is deciding what the task does next, which is the same
-        decision the outcome itself implies - resumable outcomes go back on
-        the queue, and a kill stays killed.
+        What is left is retiring the agent and, if the task still claims to
+        be running, deciding what it does next - which is what the outcome
+        says: resumable outcomes go back on the queue, a kill stays killed,
+        and a finished run keeps the verdict it had.
         """
-        # The crash may also have come before the kill removed the script.
-        remove_run_script(self.config.paths.run_script(task.id))
-        self._clear_slot(slot, SlotStatus.IDLE)
-        if not run.outcome or not run.outcome.is_resumable:
-            state = TaskState.KILLED if run.outcome is RunOutcome.KILLED else TaskState.ERROR
-            if self.store.get_task_state(task.id) not in (TaskState.MERGED, TaskState.DISCARDED):
-                self.store.set_task_state(task.id, state)
+        await self._retire(agent)
+        if self.store.get_task_state(task.id) is not TaskState.RUNNING:
             return []
-
-        task.attempt = max(task.attempt, run.attempt) + 1
-        self.store.update_task(task)
-        self.store.set_task_state(task.id, TaskState.QUEUED)
-        return [
-            TaskRequeued(
-                at=self.now(),
-                task_id=task.id,
-                next_attempt=task.attempt,
-                reason=run.outcome,
-            )
-        ]
+        outcome = run.outcome or RunOutcome.INTERRUPTED
+        if outcome.is_resumable:
+            task.attempt = max(task.attempt, run.attempt) + 1
+            with self.store.transaction():
+                self.store.update_task(task)
+                self.store.set_task_state(task.id, TaskState.QUEUED)
+            return [
+                TaskRequeued(
+                    at=self.now(), task_id=task.id, next_attempt=task.attempt, reason=outcome
+                )
+            ]
+        verdict = {
+            RunOutcome.DONE: TaskState.DONE,
+            RunOutcome.KILLED: TaskState.KILLED,
+        }.get(outcome, TaskState.ERROR)
+        self.store.set_task_state(task.id, verdict)
+        return []
 
     def _orphaned_runs(self) -> list[Event]:
-        claimed = {(slot.task_id, slot.run_attempt) for slot in self.slots()}
+        claimed = {(agent.task_id, agent.run_attempt) for agent in self.agents()}
         events: list[Event] = []
         for run in self.store.unfinished_runs():
             if (run.task_id, run.attempt) in claimed:
@@ -1189,24 +1186,22 @@ class AgentManager:
           index, every task and every run;
         - every attempt's log.
 
-        What goes: the running processes, and the worktrees. A task that was
-        running is checkpointed and requeued rather than killed, so it picks
-        up from its last commit the next time Buddy starts -
-        `kill` means kill, and this is not that.
+        What goes: the running processes, their windows, and the worktrees. A
+        task that was running is checkpointed and requeued under its name
+        rather than killed, so it picks up from its last commit the next time
+        Buddy starts - `kill` means kill, and this is not that.
         """
         report = ShutdownReport()
 
-        for slot in self.slots():
-            if not slot.status.is_occupied or not slot.task_id:
-                continue
-            task = self.store.get_task(slot.task_id)
+        for agent in self.agents():
+            task = self.store.get_task(agent.task_id)
             if task is None:
-                self._clear_slot(slot, SlotStatus.IDLE)
+                await self._retire(agent)
                 continue
             try:
-                await self._stop_and_requeue(slot, task, RunOutcome.INTERRUPTED)
-                report.stopped.append(f"{slot.name} ({task.id})")
-            except Exception as exc:  # noqa: BLE001 - one slot, not the shutdown
+                await self._stop_and_requeue(agent, task, RunOutcome.INTERRUPTED)
+                report.stopped.append(f"{agent.name} ({task.id})")
+            except Exception as exc:  # noqa: BLE001 - one agent, not the shutdown
                 report.failed.append((task.id, f"could not stop: {exc}"))
 
         if not remove_worktrees:
@@ -1246,47 +1241,34 @@ class AgentManager:
         return held
 
     def list_agents(self) -> list[dict]:
-        """The slot table, sorted by priority, each with a two-line tail."""
-        order = {name: index for index, name in enumerate(SLOT_NAMES)}
+        """Every running agent, most urgent first, each with a two-line tail."""
         rows = []
-        for slot in sorted(
-            self.slots(),
-            key=lambda s: (s.priority is None, s.priority or 0, order[s.name]),
-        ):
-            task = self.store.get_task(slot.task_id) if slot.task_id else None
-            run = (
-                self.store.get_run(slot.task_id, slot.run_attempt)
-                if slot.task_id and slot.run_attempt
-                else None
-            )
+        for agent in self.agents():
+            task = self.store.get_task(agent.task_id)
+            run = self.store.get_run(agent.task_id, agent.run_attempt)
             rows.append(
                 {
-                    "slot": slot.name,
-                    "status": slot.status.value,
-                    "task_id": slot.task_id,
+                    "agent": agent.name,
+                    "status": agent.status.value,
+                    "task_id": agent.task_id,
                     "title": task.title if task else None,
-                    "harness": slot.harness,
-                    "priority": slot.priority,
+                    "harness": agent.harness,
+                    "priority": agent.priority,
                     "branch": run.branch if run else None,
                     "age_seconds": (
-                        int((self.now() - slot.started_at).total_seconds())
-                        if slot.started_at
+                        int((self.now() - agent.started_at).total_seconds())
+                        if agent.started_at
                         else None
                     ),
-                    "tail": tail(slot.last_output, 2),
+                    "tail": tail(agent.last_output, 2),
                 }
             )
         return rows
 
     def get_output(self, target: str, lines: int = 60) -> str:
-        """Tail of the log, ANSI stripped, for a slot name or a task id."""
-        task_id = target
-        if target in SLOT_NAMES:
-            slot = self._slot(target)
-            if not slot.task_id:
-                return ""
-            task_id = slot.task_id
-        run = self.store.latest_run(task_id)
+        """Tail of the log, ANSI stripped, for an agent's name or a task id."""
+        task = self.store.find_task(target)
+        run = self.store.latest_run(task.id) if task else None
         return read_tail(run.log_path, lines) if run else ""
 
     def still_working(self, task_id: str) -> str | None:
@@ -1300,12 +1282,12 @@ class AgentManager:
         """
         if self.store.get_task_state(task_id) is not TaskState.RUNNING:
             return None
-        slot = next((s.name for s in self.slots() if s.task_id == task_id), None)
-        if slot is None:
+        agent = next((a for a in self.agents() if a.task_id == task_id), None)
+        if agent is None:
             return f"{task_id} is still running. Let it finish first."
         return (
-            f"{task_id} is still running in {slot}, and its agent is working in the worktree. "
-            f"Let it finish, or stop it first with `buddy kill {slot}`."
+            f"{task_id} is still running as {agent.name}, which is working in the worktree. "
+            f"Let it finish, or stop it first with `buddy kill {agent.name}`."
         )
 
     def reprioritize(self, task_id: str, new_priority: int) -> None:
@@ -1316,41 +1298,43 @@ class AgentManager:
             raise KeyError(f"no such task: {task_id}")
         task.priority = new_priority
         self.store.update_task(task)
-        for slot in self.slots():
-            if slot.task_id == task_id:
-                slot.priority = new_priority
-                self.store.save_slot(slot)
+        for agent in self.agents():
+            if agent.task_id == task_id:
+                agent.priority = new_priority
+                self.store.save_agent(agent)
 
-    async def kill_agent(self, slot_name: str) -> list[Event]:
+    async def kill_agent(self, name: str) -> list[Event]:
         """Kill and checkpoint. The task is marked killed, not requeued: that
         is what kill means."""
-        slot = self._slot(slot_name)
-        task = self.store.get_task(slot.task_id) if slot.task_id else None
-        run = (
-            self.store.get_run(slot.task_id, slot.run_attempt)
-            if slot.task_id and slot.run_attempt
-            else None
-        )
-        await self._kill(slot_name, slot.task_id)
+        agent = self.agent(name)
+        if agent is None:
+            raise KeyError(f"no running agent is called {name}")
+        task = self.store.get_task(agent.task_id)
+        run = self.store.get_run(agent.task_id, agent.run_attempt)
+        await self._kill(agent.name, agent.task_id)
         events: list[Event] = []
-        if task is not None:
+        if run is not None:
+            run.wip_commit = await self.workspace.checkpoint(run, RunOutcome.KILLED)
+            run.ended_at = self.now()
+            run.outcome = RunOutcome.KILLED
+        with self.store.transaction():
             if run is not None:
-                run.wip_commit = await self.workspace.checkpoint(run, RunOutcome.KILLED)
-                run.ended_at = self.now()
-                run.outcome = RunOutcome.KILLED
                 self.store.save_run(run)
-            self.store.set_task_state(task.id, TaskState.KILLED)
+            if task is not None:
+                self.store.set_task_state(task.id, TaskState.KILLED)
+            self.store.remove_agent(agent.name)
+        self._log_sizes.pop(agent.name, None)
+        if task is not None:
             events.append(
                 TaskFinished(
                     at=self.now(),
                     task_id=task.id,
-                    slot=slot_name,
+                    agent=agent.name,
                     attempt=run.attempt if run else task.attempt,
                     outcome=RunOutcome.KILLED,
                     branch=run.branch if run else "",
                     summary="killed",
                 )
             )
-        self._clear_slot(slot, SlotStatus.KILLED)
         events.extend(await self.schedule())
         return events

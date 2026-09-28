@@ -277,10 +277,10 @@ async def test_a_launch_that_fails_to_schedule_is_not_launched_twice(
     async def unreachable(*args, **kwargs):
         raise TmuxError("tmux new-session failed (1): no server")
 
-    real = manager.runner.ensure_session
-    manager.runner.ensure_session = unreachable
+    real = manager.runner.spawn
+    manager.runner.spawn = unreachable
     launched, kept = await brain.launch_drafts()
-    manager.runner.ensure_session = real
+    manager.runner.spawn = real
 
     assert kept == [] and len(launched) == 1 and "queued" in launched[0]
     assert brain.brainstorm.drafts == {}

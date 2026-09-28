@@ -366,7 +366,7 @@ async def test_layout_creates_the_tree_and_migrates_the_schema(tmp_path):
     with Store(paths.db) as store:
         assert store.schema_version() == SCHEMA_VERSION
         assert "conversation_log_fts" in store.table_names()
-        assert len(store.load_slots()) == 7
+        assert "agents" in store.table_names()
 
 
 async def test_layout_notices_a_missing_fts_index(tmp_path):
@@ -433,7 +433,9 @@ async def test_re_running_config_keeps_a_hand_edited_value(tmp_path):
     await run_steps(ctx, [ConfigStep()])
 
     path = Config(home=ctx.home).paths.config_file
-    path.write_text(path.read_text().replace("max_concurrent   = 7", "max_concurrent   = 3"))
+    written = path.read_text()
+    assert "max_concurrent   = 0" in written, "the edit below would silently do nothing"
+    path.write_text(written.replace("max_concurrent   = 0", "max_concurrent   = 3"))
 
     later = make_ctx(tmp_path, no_voice=True)
     later.section("buddy")["max_concurrent"] = 7
@@ -567,7 +569,7 @@ async def test_the_whole_of_setup_against_this_machine(
     assert "project" in config.projects
     assert config.runnable_harnesses()
     assert by_name["tmux"].status in (Status.DONE, Status.SKIPPED)
-    assert "Monday" in by_name["tmux"].detail
+    assert "each agent gets its own window" in by_name["tmux"].detail
 
     # The lock knows what to compare against next time.
     lock = json.loads(config.paths.setup_lock.read_text())

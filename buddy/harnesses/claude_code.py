@@ -163,7 +163,7 @@ class ClaudeCodeAdapter(BaseAdapter):
 def describe_events(log_text: str, limit: int = 20) -> list[str]:
     """The stream as lines a human can read.
 
-    Raw stream-json in a slot card is no more use than a blank one, and the layer rule
+    Raw stream-json in an agent card is no more use than a blank one, and the layer rule
     says only this module may know what Claude Code's output looks like - so
     the translation lives here rather than in the manager or the dashboard.
     """

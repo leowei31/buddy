@@ -420,8 +420,8 @@ class BaseAdapter:
         Stall detection reads log growth as progress. That is right for
         almost everything, and wrong for a harness that has lost its API and
         prints a retry line every few seconds forever: the log grows, the
-        slot says RUNNING, and nothing is happening. An adapter that knows
-        its own retry lines returns False for them, so the slot goes STALLED
+        agent says RUNNING, and nothing is happening. An adapter that knows
+        its own retry lines returns False for them, so the agent goes STALLED
         after `stall_timeout` like any other run that is going nowhere.
         """
         return True

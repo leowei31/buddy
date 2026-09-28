@@ -101,7 +101,7 @@ class CodexAdapter(BaseAdapter):
                 "and the network is off, so installs and most builds will fail mid-task"
             )
         if "--json" not in command:
-            notes.append("command has no --json: the slot card will show raw text only")
+            notes.append("command has no --json: the agent card will show raw text only")
         return notes
 
     async def auth_status(self) -> tuple[bool | None, str]:
@@ -203,7 +203,7 @@ def unwrap_shell(command: str) -> str:
 
 
 def describe_events(log_text: str, limit: int = 20) -> list[str]:
-    """Codex's JSON lines as sentences for a slot card."""
+    """Codex's JSON lines as sentences for an agent card."""
     described: list[str] = []
     for event in stream.events(log_text):
         if isinstance(event, str):

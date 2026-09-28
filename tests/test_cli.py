@@ -155,7 +155,7 @@ def test_merge_of_an_unknown_task(home: Path):
 def test_logs_of_an_unknown_task(home: Path):
     result = runner.invoke(app, ["logs", "t-9999"])
     assert result.exit_code == 2
-    assert "no such task" in result.stdout
+    assert "no such task or agent" in result.stdout
 
 
 def test_the_store_and_layout_are_created_on_first_use(home: Path):
@@ -251,7 +251,7 @@ async def test_brainstorm_then_go_from_the_terminal(home, monkeypatch, capsys):
     # Exactly the draft, now a real task, and nothing before /go.
     [task] = runtime.store.recent_tasks()
     assert task.title == "Add rate limits" and "429 past 100/min" in task.brief
-    assert runtime.manager.runner.spawned == [("Monday", "t-0001", 1)]
+    assert runtime.manager.runner.spawned == [("add-rate-limits", "t-0001", 1)]
 
 
 # -- setup, update, uninstall ----------------------------------------
@@ -363,12 +363,14 @@ def test_spawn_when_tmux_cannot_start_says_so_instead_of_a_traceback(home: Path,
     async def refuse(self, *args, **kwargs):
         raise TmuxError("tmux new-session failed (1): error connecting (File name too long)")
 
-    monkeypatch.setattr(TmuxRunner, "ensure_session", refuse)
+    monkeypatch.setattr(TmuxRunner, "open_window", refuse)
     monkeypatch.setattr("buddy.harnesses.claude_code.ClaudeCodeAdapter.preflight", _usable_report)
+    (home / "webapp").mkdir()  # a project that exists, so tmux is what fails
     result = runner.invoke(app, ["spawn", "webapp", "do a thing"])
     assert result.exit_code == 1
-    assert "t-0001 is queued, but tmux would not start it" in result.stdout
+    assert "t-0001 (do-a-thing) is queued, but tmux would not start it" in result.stdout
     assert "Traceback" not in result.stdout
+    assert not list((home / "tasks").glob("*/run.sh")), "no resolved script left behind"
 
 
 async def _usable_report(self):
