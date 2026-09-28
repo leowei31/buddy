@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local state (Buddy's runtime lives in ~/.buddy, never in the repo). Listed
+# anyway, for anyone who points BUDDY_HOME inside a checkout.
+.buddy/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.log.1
+brainstorm.json
+control.sock
+overlay.pid
+setup.lock
+platform.json
+
+# Secrets. Nothing here belongs in git; scripts/check-secrets.py and the
+# pre-commit hook in .githooks/ refuse them even when forced.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+.netrc
+.pypirc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials.json
+application_default_credentials.json
+*service-account*.json
+*service_account*.json
+keys/
+
+# Claude Code's per-machine settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuse a commit that would put a secret into git. See scripts/check-secrets.py.
+#
+# Enabled per clone with:  git config core.hooksPath .githooks
+# It works for any repository pointed at this directory, not only Buddy's.
+buddy=$(cd "$(dirname "$0")/.." && pwd)
+python="$buddy/.venv/bin/python"
+[ -x "$python" ] || python=python3
+exec "$python" "$buddy/scripts/check-secrets.py" --staged

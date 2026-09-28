@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y tmux
+          else
+            brew install tmux
+          fi
+          tmux -V
+
+      # Real harness binaries, so the adapters are tested against what the
+      # CLIs actually print. Their success paths run against scripted model
+      # servers on localhost: no accounts, no keys, no cost.
+      - name: Harness CLIs
+        # Third-party installers. If one is down, its tests skip rather than
+        # the whole run failing for a reason that is not Buddy's.
+        continue-on-error: true
+        run: |
+          npm install -g @openai/codex opencode-ai
+          curl -fsSL https://antigravity.google/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: git identity
+        run: |
+          git config --global user.name "Buddy CI"
+          git config --global user.email "ci@example.com"
+          git config --global init.defaultBranch main
+
+      - run: uv sync
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy
+      - run: uv run pytest
+
+  secrets:
+    name: no secrets anywhere in history
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # every commit, not just the last one
+      - name: Scan every file ever committed
+        run: python3 scripts/check-secrets.py --history
+
+  package:
+    name: wheel installs and runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - name: Install the wheel alone, outside the source tree
+        run: |
+          uv venv /tmp/wheel
+          VIRTUAL_ENV=/tmp/wheel uv pip install dist/*.whl
+          cd /tmp
+          /tmp/wheel/bin/buddy --version
+          /tmp/wheel/bin/python -c "from buddy.tmux_runner import LOGPIPE; assert LOGPIPE.exists(), LOGPIPE"
+          /tmp/wheel/bin/python -c "import buddy.web.server as s, pathlib; assert (pathlib.Path(s.__file__).parent / 'static' / 'vendor' / 'xterm.js').exists()"

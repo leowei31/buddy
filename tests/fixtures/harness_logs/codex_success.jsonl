@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a0a12e-68fa-7ad3-bb4e-7ff233b1695e"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `fake-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"printf 'hi from codex\\\\n' > hello.txt && git add hello.txt && git -c user.email=a@b.c -c user.name=agent commit -qm 'add hello'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"printf 'hi from codex\\\\n' > hello.txt && git add hello.txt && git -c user.email=a@b.c -c user.name=agent commit -qm 'add hello'\"","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Created hello.txt and committed it."}}
+{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}

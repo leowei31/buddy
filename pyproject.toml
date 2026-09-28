@@ -1,0 +1,152 @@
+[project]
+name = "buddy-orchestrator"
+version = "0.1.0"
+description = "A voice-driven, harness-agnostic multi-agent orchestrator."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Hanzhe \"Leo\" Wei" }]
+license = { file = "LICENSE" }
+keywords = ["agents", "orchestrator", "tmux", "git-worktree", "claude-code", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+]
+
+# Exactly what the code imports: each one is here because something uses it.
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    # The earliest release this code is known to work with. A lower floor let
+    # an install outside the lockfile (`pip install .`, an isolated resolver)
+    # land on a pre-1.x SDK this code has never run against.
+    "anthropic>=1.4",
+    "openai>=1.50",
+    "fastapi>=0.111",
+    # Plain uvicorn, not `uvicorn[standard]`: the extras pull compiled
+    # packages (uvloop, httptools, watchfiles) for speed the dashboard does
+    # not need, and each is another wheel that has to exist for the platform.
+    "uvicorn>=0.30",
+    # uvicorn has no websocket protocol of its own, and the dashboard is half
+    # websockets, so this is a hard requirement rather than an extra.
+    "websockets>=12",
+    # Secrets go to the OS keychain, never into config.toml.
+    "keyring>=25",
+    # Setup merges new keys into an existing config.toml and never overwrites
+    # it, which means editing TOML without losing the comments and ordering
+    # the user put there. tomllib can only read.
+    "tomlkit>=0.13",
+    # `voice/tts.py` talks to Fish Audio's local and cloud servers with this
+    # directly (deferred imports, since voice is optional). Not the same
+    # package as plain `httpx`, which `anthropic` and `openai` depend on -
+    # this is its own dependency, declared as one rather than assumed free.
+    "httpx2>=2.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/leowei31/buddy"
+Source = "https://github.com/leowei31/buddy"
+Issues = "https://github.com/leowei31/buddy/issues"
+
+[project.optional-dependencies]
+# The brain is provider-agnostic, but the two Google-auth providers pull in
+# `cryptography`, which no longer ships wheels for every platform. Keeping them
+# optional means the core install never needs a Rust toolchain, and
+# `providers/*` stays genuinely pluggable.
+vertex = ["anthropic[vertex]>=1.4"]
+# A native always-on-top panel. Optional because it pulls in the whole Cocoa
+# bridge, which not every machine running an orchestrator wants.
+overlay = ["pywebview>=5.0"]
+# The voice layer and the setup steps that stand it up. Kept optional so
+# a machine that only orchestrates agents does not pull a speech stack.
+voice = [
+    "faster-whisper>=1.0",
+    "sounddevice>=0.4",
+    "numpy>=1.26",
+    # Fish's /v1/tts and /v1/tts/live are both MessagePack.
+    "msgpack>=1.0",
+    # faster-whisper pulls onnxruntime in for its VAD, and onnxruntime stopped
+    # shipping Intel-macOS wheels after 1.23.2. Constraining only that platform
+    # keeps every other one on the current release.
+    "onnxruntime<=1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+gemini = ["google-genai>=1.0"]
+all = [
+    "anthropic[vertex]>=1.4",
+    "google-genai>=1.0",
+    "faster-whisper>=1.0",
+    "sounddevice>=0.4",
+    "numpy>=1.26",
+    "msgpack>=1.0",
+    "onnxruntime<=1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
+[project.scripts]
+buddy = "buddy.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.5",
+    # msgpack and sounddevice are needed to exercise the voice layer, and a
+    # fake Fish server needs the same wire format the real one uses.
+    "msgpack>=1.0",
+    "mypy>=1.18",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["buddy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Async tests need no decorator. Every module in Buddy is async, so auto mode
+# keeps the test suite free of per-test boilerplate.
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+# The suite drives real tmux, git, and subprocesses. A hang is a bug, and a
+# bug that only shows as "CI never finished" is the worst kind.
+timeout = 120
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["buddy"]
+# Bodies are checked even where a signature is unannotated: that is where the
+# `None` that crashes at runtime usually hides.
+check_untyped_defs = true
+warn_unused_ignores = true
+# The optional extras (voice, overlay, Vertex) are not installed everywhere.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# numpy's own stubs use 3.12-only syntax, which fails a 3.11 check before
+# Buddy's code is reached. Buddy's correctness does not rest on numpy's types.
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer's idiom is a call in the argument default; that is the API.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]

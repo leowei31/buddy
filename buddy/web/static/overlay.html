@@ -1,0 +1,427 @@
+<title>Buddy</title>
+<style>
+  /* The glance surface: a native always-on-top panel, not a browser tab.
+     Everything here is sized for the corner of a screen you are not looking
+     at directly - bigger status colour, less text, no navigation. */
+  :root {
+    --bg: #0b0e14;
+    --panel: #141922;
+    --border: #232b38;
+    --text: #e5e9f0;
+    --muted: #8792a6;
+    --dim: #5d6779;
+    --idle: #6b7688;
+    --running: #4da3ff;
+    --waiting_input: #ffb454;
+    --stalled: #ff8f4d;
+    --done: #4cc38a;
+    --error: #ff6b6b;
+    --killed: #b57edc;
+    --interrupted: #d9a441;
+    --thinking: #c792ea;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    /* Height follows the content, so measuring `#shell` measures what is
+       actually there rather than whatever the window happens to be. */
+    height: auto;
+    background: transparent;
+    overflow: hidden;
+    font: 12px/1.4 var(--sans);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    cursor: default;
+    user-select: none;
+  }
+
+  #shell {
+    display: flex;
+    flex-direction: column;
+    /* Opaque, not frosted: WKWebView does not composite `backdrop-filter`
+       over a transparent native window, so anything less than solid means
+       reading whatever is behind the panel through the text. */
+    background: #0b0e14;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  }
+
+  /* pywebview makes this class draggable, which is the only way to move a
+     frameless window. */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    -webkit-app-region: drag;
+  }
+
+  .mark { width: 8px; height: 8px; border-radius: 2px; background: var(--running); }
+  .name { font-family: var(--mono); font-weight: 600; letter-spacing: -0.01em; }
+  .spacer { flex: 1; }
+
+  .summary {
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    -webkit-app-region: no-drag;
+    border: none;
+    background: transparent;
+    color: var(--dim);
+    font: inherit;
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  button:hover { color: var(--text); background: var(--panel); }
+
+  /* No inner scrolling: the window grows instead, up to the cap in
+     overlay.py. A panel you have to scroll is not a glance. */
+  #slots { padding: 4px 0; }
+
+  .slot {
+    display: grid;
+    /* minmax(0, ...), not 1fr: a grid column's minimum is otherwise its
+       longest unbreakable line, and five idle slot names on one line made
+       the panel wider than its window - clipping the header's summary and
+       fold button off the right edge. */
+    grid-template-columns: 8px minmax(0, 1fr);
+    gap: 8px;
+    align-items: start;
+    padding: 6px 12px;
+  }
+  .slot.idle { opacity: 0.42; }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    margin-top: 4px;
+    border-radius: 50%;
+    background: var(--status, var(--idle));
+  }
+  .slot.running .dot { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
+  @media (prefers-reduced-motion: reduce) { .slot.running .dot { animation: none } }
+
+  .who { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+  .who b {
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .who span { flex: none; }
+  .who span { font-family: var(--mono); font-size: 10px; color: var(--status, var(--dim)); }
+
+  .title {
+    margin-top: 1px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .doing {
+    margin-top: 2px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  footer {
+    padding: 6px 12px;
+    border-top: 1px solid var(--border);
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--dim);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* The composer. Hidden until the window's own process says a session is
+     listening, because a text box that silently does nothing is worse than
+     no text box. */
+  #composer { display: none; border-top: 1px solid var(--border); }
+  body.can-say #composer { display: block; }
+
+  #composer form { display: flex; align-items: center; gap: 6px; padding: 6px 10px; }
+
+  #say {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 0;
+  }
+  #say::placeholder { color: var(--dim); }
+  #say:disabled { opacity: 0.5; }
+
+  #composer .chev { color: var(--dim); font-family: var(--mono); font-size: 11px; }
+
+  #reply {
+    display: none;
+    padding: 0 12px 8px 12px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--dim);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  #reply.shown { display: block; }
+  #reply.failed { color: var(--waiting_input); }
+
+  /* Collapsed: one line you can leave on screen all day. */
+  body.collapsed #slots, body.collapsed footer, body.collapsed #composer { display: none; }
+  body.collapsed header { border-bottom: none; }
+
+  .offline { padding: 14px 12px; color: var(--dim); text-align: center; }
+</style>
+
+<div id="shell">
+  <header>
+    <span class="mark" id="mark"></span>
+    <span class="name">buddy</span>
+    <span class="spacer"></span>
+    <span class="summary" id="summary"></span>
+    <button id="fold" title="Collapse">–</button>
+  </header>
+  <div id="slots"></div>
+  <div id="composer">
+    <form id="sayForm" autocomplete="off">
+      <span class="chev">&gt;</span>
+      <input id="say" type="text" placeholder="tell buddy&hellip;" maxlength="4000" />
+    </form>
+    <div id="reply"></div>
+  </div>
+  <footer id="footer"></footer>
+</div>
+
+<script>
+  "use strict";
+
+  const slotsEl = document.getElementById("slots");
+  const summaryEl = document.getElementById("summary");
+  const footerEl = document.getElementById("footer");
+  const markEl = document.getElementById("mark");
+  const foldEl = document.getElementById("fold");
+
+  function el(tag, props, ...kids) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v === null || v === undefined || v === false) continue;
+      if (k === "class") node.className = v;
+      else if (k === "text") node.textContent = v;
+      else node.setAttribute(k, v);
+    }
+    for (const kid of kids.flat()) if (kid) node.append(kid);
+    return node;
+  }
+
+  const label = (s) => (s === "waiting_input" ? "needs input" : (s || "").replace(/_/g, " "));
+
+  function ago(seconds) {
+    if (seconds === null || seconds === undefined) return "";
+    const s = Math.round(seconds);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
+  }
+
+  function row(slot) {
+    const status = slot.status;
+    const line = el("div", { class: `slot ${status}`, style: `--status: var(--${status})` });
+    line.append(el("div", { class: "dot" }));
+
+    const body = el("div", {});
+    body.append(
+      el("div", { class: "who" },
+        el("b", { text: slot.name }),
+        el("span", { text: label(status) + (slot.age_seconds ? ` · ${ago(slot.age_seconds)}` : "") })
+      )
+    );
+    if (slot.title) body.append(el("div", { class: "title", text: slot.title }));
+    if (slot.tail) {
+      // The last line of what the agent is actually doing, not raw output:
+      // the harness adapter has already turned its own format into sentences.
+      const last = slot.tail.split("\n").filter((l) => l.trim()).pop();
+      if (last) body.append(el("div", { class: "doing", text: last }));
+    }
+    line.append(body);
+    return line;
+  }
+
+  function offline(why) {
+    slotsEl.replaceChildren(el("div", { class: "offline", text: why }));
+    summaryEl.textContent = "";
+    footerEl.textContent = "start a session with `buddy`";
+    markEl.style.background = "var(--dim)";
+    fitWindow();
+  }
+
+  async function refresh() {
+    let slots, queued, storm;
+    try {
+      const [a, b, c] = await Promise.all([
+        fetch("/api/slots").then((r) => r.json()),
+        fetch("/api/tasks?state=queued&limit=100").then((r) => r.json()),
+        fetch("/api/brainstorm").then((r) => r.json()),
+      ]);
+      slots = a.slots;
+      queued = b.tasks;
+      storm = c;
+    } catch (_) {
+      offline("Buddy is not running");
+      return;
+    }
+
+    markEl.style.background = "var(--running)";
+    // Idle slots are three lines that say nothing. One line says the same.
+    const busySlots = slots.filter((s) => s.task_id);
+    const idle = slots.filter((s) => !s.task_id).map((s) => s.name);
+    const rendered = busySlots.map(row);
+    if (idle.length) {
+      rendered.push(
+        el("div", { class: "slot idle", style: "--status: var(--idle)" },
+          el("div", { class: "dot" }),
+          el("div", {}, el("div", { class: "who" },
+            el("b", { text: idle.join(", ") }), el("span", { text: "idle" })))
+        )
+      );
+    }
+    slotsEl.replaceChildren(...rendered);
+
+    const busy = slots.filter((s) => s.occupied).length;
+    const attention = slots.filter((s) => s.status === "waiting_input" || s.status === "stalled");
+    const drafts = storm.drafts.length;
+    // Something needing you outranks brainstorming; brainstorming outranks a count.
+    summaryEl.textContent = attention.length
+      ? `${attention.length} need${attention.length === 1 ? "s" : ""} you`
+      : storm.active
+        ? `thinking${drafts ? ` · ${drafts} draft${drafts === 1 ? "" : "s"}` : ""}`
+        : `${busy} running`;
+    markEl.style.background = attention.length
+      ? "var(--waiting_input)"
+      : storm.active ? "var(--thinking)" : "var(--running)";
+
+    const parts = [`${busy} running`, `${queued.length} queued`];
+    if (storm.active) parts.unshift("/go starts drafts");
+    const waiting = attention.map((s) => s.name);
+    if (waiting.length) parts.push(`${waiting.join(", ")}: needs input`);
+    footerEl.textContent = parts.join("  ·  ");
+    fitWindow();
+  }
+
+  /* The panel is exactly as tall as what it is showing. A fixed height means
+     either a cropped list or a slab of empty black in the corner of a screen
+     - and the number of busy slots changes all day. */
+  let lastHeight = 0;
+  let bridgeReady = false;
+  window.addEventListener("pywebviewready", () => {
+    // The js_api is not there at first paint, so the first fit has to wait
+    // for this rather than measuring into the void.
+    bridgeReady = true;
+    lastHeight = 0;
+    fitWindow();
+    checkComposer();
+  });
+
+  function fitWindow() {
+    if (!bridgeReady || !window.pywebview || document.body.classList.contains("collapsed")) return;
+    const wanted = Math.ceil(document.getElementById("shell").getBoundingClientRect().height);
+    if (wanted && Math.abs(wanted - lastHeight) > 2) {
+      lastHeight = wanted;
+      window.pywebview.api.set_height(wanted);
+    }
+  }
+
+  foldEl.addEventListener("click", () => {
+    const folded = document.body.classList.toggle("collapsed");
+    foldEl.textContent = folded ? "+" : "–";
+    foldEl.title = folded ? "Expand" : "Collapse";
+    // The window follows, so a collapsed overlay takes one line of screen.
+    if (window.pywebview) window.pywebview.api.set_folded(folded);
+  });
+
+  /* Typing. The page never opens the socket itself - it asks this window's
+     own Python process, which is the only thing holding it. */
+  const sayEl = document.getElementById("say");
+  const replyEl = document.getElementById("reply");
+  const sayForm = document.getElementById("sayForm");
+
+  function showReply(text, failed) {
+    replyEl.textContent = text || "";
+    replyEl.classList.toggle("shown", Boolean(text));
+    replyEl.classList.toggle("failed", Boolean(failed));
+    fitWindow();
+  }
+
+  async function checkComposer() {
+    if (!bridgeReady || !window.pywebview) return;
+    let able = false;
+    try {
+      able = await window.pywebview.api.can_say();
+    } catch (err) {
+      able = false;
+    }
+    const was = document.body.classList.contains("can-say");
+    document.body.classList.toggle("can-say", Boolean(able));
+    if (was !== Boolean(able)) fitWindow();
+  }
+
+  sayForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = sayEl.value.trim();
+    if (!text || sayEl.disabled) return;
+    sayEl.disabled = true;
+    sayEl.value = "";
+    showReply("thinking\u2026", false);
+    try {
+      const result = await window.pywebview.api.say(text);
+      if (result && result.ok) showReply(result.text || "(no reply)", false);
+      else showReply((result && result.error) || "the session did not answer", true);
+    } catch (err) {
+      showReply(String(err), true);
+    } finally {
+      sayEl.disabled = false;
+      sayEl.focus();
+    }
+  });
+
+  // Escape clears the reply, so the panel goes back to its one-glance size.
+  sayEl.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { sayEl.value = ""; showReply("", false); }
+  });
+
+  refresh();
+  setInterval(refresh, 1500);
+  setInterval(checkComposer, 3000);
+</script>

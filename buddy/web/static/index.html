@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Buddy</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/vendor/xterm.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">buddy</span>
+      </a>
+      <nav class="tabs" id="tabs">
+        <a href="#/" data-route="dashboard">Dashboard</a>
+        <a href="#/conversation" data-route="conversation">Conversation</a>
+      </nav>
+      <div class="spacer"></div>
+      <!-- This is a viewer. The only control it has is over itself. -->
+      <span class="readonly" title="The dashboard never issues commands">read-only</span>
+      <div class="conn" id="conn">
+        <span class="conn-dot"></span><span class="conn-text">connecting</span>
+      </div>
+    </header>
+
+    <main id="view" class="view"></main>
+
+    <script src="/static/vendor/xterm.js"></script>
+    <script src="/static/vendor/xterm-addon-fit.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

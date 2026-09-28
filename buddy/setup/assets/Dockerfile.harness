@@ -1,0 +1,76 @@
+# The second isolation boundary.
+#
+# Worktree + branch is the boundary Buddy always has: nothing an agent does
+# reaches your base branch without `buddy merge`. This is the one you add
+# once auto-approve is on, so an agent that decides to run something
+# destructive can only reach what was mounted - the worktree it was given,
+# the brief it was asked to read, and the repository's git directory it
+# commits to, with that repository's config and hooks read-only.
+#
+#   docker build -f Dockerfile.harness -t buddy-harness:latest .
+#
+# Then in ~/.buddy/config.toml:
+#
+#   [harness.claude_code]
+#   sandbox = "docker"
+#   sandbox_command = "docker run --rm -v {worktree}:{worktree} \
+#       -v {prompt_path}:{prompt_path}:ro -w {worktree} --network host{git}{env} \
+#       --entrypoint sh buddy-harness:latest -c {command}"
+#
+# See docs/configuration.md for what each part is for, including why there
+# is no `-i`, what `{env}` forwards, and why `{git}` is needed to commit.
+#
+# The harness CLI is not installed here. Setup's first rule is that Buddy
+# does not install or log in to your coding-agent CLIs, and that does not
+# stop being true inside a container - so the image carries the toolchain and
+# you add the CLI and its auth. Two hooks:
+#
+#   --build-arg HARNESS_INSTALL="@anthropic-ai/claude-code @openai/codex opencode-ai"
+#       npm packages, for the CLIs that ship on npm
+#   --build-arg ANTIGRAVITY=1
+#       Google's own installer for `agy`, which is not on npm
+#
+# Auth does not come with the binary. Pass the key a harness reads through
+# `[harness.<name>.env]` (CODEX_API_KEY, ANTHROPIC_API_KEY, ...), or mount
+# the CLI's login directory read-only in `sandbox_command` - for example
+# `-v ~/.codex:/home/node/.codex:ro`.
+
+# Pinnable so a mirror, an air-gapped registry or a different Node release
+# can be used: --build-arg BASE_IMAGE=your-registry/node:22-slim
+ARG BASE_IMAGE=node:22-slim
+FROM ${BASE_IMAGE}
+
+ARG HARNESS_INSTALL=""
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+# An agent running as root in a container that mounts your worktree would
+# leave root-owned files behind in it.
+ARG UID=1000
+ARG GID=1000
+RUN groupmod -g "${GID}" node 2>/dev/null || true \
+    && usermod -u "${UID}" -g "${GID}" node 2>/dev/null || true
+
+RUN if [ -n "${HARNESS_INSTALL}" ]; then npm install -g ${HARNESS_INSTALL}; fi
+
+# Installed for the `node` user, into a directory already on its PATH, so the
+# installer's own shell-profile step has nothing it needs to change.
+ARG ANTIGRAVITY=""
+ENV PATH="/home/node/.local/bin:${PATH}"
+RUN if [ -n "${ANTIGRAVITY}" ]; then \
+        su node -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash'; \
+    fi
+
+# git refuses to touch a repo owned by another uid; the worktree is bind
+# mounted from the host, so that is the normal case here rather than a
+# suspicious one.
+RUN git config --system --add safe.directory '*'
+
+USER node
+
+# No ENTRYPOINT on purpose. `sandbox_command` runs `sh -c '<the harness
+# command>'`, so the shell is named there, where the command is: an image
+# whose entrypoint was itself a shell swallowed every argument after the
+# first, and a harness ran with none of its flags.
