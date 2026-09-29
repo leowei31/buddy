@@ -1260,3 +1260,41 @@ async def test_a_pane_killed_by_a_signal_before_it_finished_reports_the_signal(
 
     assert finished.exit_code == 137, "128 + SIGKILL, as a shell would say"
     assert store.get_task_state(task.id) is TaskState.ERROR
+
+
+async def test_a_dead_pane_waits_briefly_for_tmux_to_say_how_it_ended(
+    manager, store, runner, config, clock
+):
+    """Measured on Linux: tmux marks a pane dead a moment before it has
+    reaped the process, so for one poll there is no status, no signal and -
+    if the log pipe is behind - no DONE line either. Finalizing then turned
+    a success into an error; it waits instead, but not forever."""
+    task = make_task(store)
+    await manager.submit(task)
+    write_log(store, config, task.id, "working\n")
+    runner.panes_state[task.agent] = PaneStatus(exists=True, dead=True, exit_code=None)
+
+    assert kinds(await manager.tick(), TaskFinished) == []
+    assert store.get_task_state(task.id) is TaskState.RUNNING
+
+    # The next poll has it.
+    runner.panes_state[task.agent] = PaneStatus(exists=True, dead=True, exit_code=0)
+    [finished] = kinds(await manager.tick(), TaskFinished)
+    assert finished.exit_code == 0
+    assert store.get_task_state(task.id) is TaskState.DONE
+
+
+async def test_a_dead_pane_that_never_says_how_it_ended_is_still_finalized(
+    manager, store, runner, config, clock
+):
+    task = make_task(store)
+    await manager.submit(task)
+    write_log(store, config, task.id, "working\n")
+    runner.panes_state[task.agent] = PaneStatus(exists=True, dead=True, exit_code=None)
+    await manager.tick()
+
+    clock.advance(seconds=11)
+    [finished] = kinds(await manager.tick(), TaskFinished)
+
+    assert finished.exit_code == -1
+    assert store.get_task_state(task.id) is TaskState.ERROR

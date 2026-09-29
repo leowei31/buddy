@@ -451,6 +451,9 @@ class AgentManager:
         #: Which projects are not git repos and so run one agent at a time.
         #: Filled by `refresh_project_locks`.
         self._exclusive: dict[str, bool] = {}
+        #: When each agent's pane was first seen dead with no outcome yet -
+        #: tmux marks a pane dead a moment before it has reaped the process.
+        self._dead_since: dict[str, datetime] = {}
 
     @property
     def max_concurrent(self) -> int | None:
@@ -502,7 +505,12 @@ class AgentManager:
         await self.runner.close_window(agent.name)
         remove_run_script(self.config.paths.run_script(agent.task_id))
         self.store.remove_agent(agent.name)
-        self._log_sizes.pop(agent.name, None)
+        self._forget(agent.name)
+
+    def _forget(self, name: str) -> None:
+        """Drop what this process remembered about an agent that has ended."""
+        self._log_sizes.pop(name, None)
+        self._dead_since.pop(name, None)
 
     # -- dependencies ----------------------------------------------
 
@@ -859,7 +867,7 @@ class AgentManager:
             self.store.update_task(task)
             self.store.set_task_state(task.id, TaskState.QUEUED)
             self.store.remove_agent(agent.name)
-        self._log_sizes.pop(agent.name, None)
+        self._forget(agent.name)
         return [
             TaskRequeued(at=self.now(), task_id=task.id, next_attempt=task.attempt, reason=outcome)
         ]
@@ -948,8 +956,29 @@ class AgentManager:
             # reachable at runtime too if someone closes the window.
             return await self._handle_missing_window(agent, task)
         if pane.dead:
-            return [await self._finalize(agent, task, self._exit_code(agent, task, pane))]
+            return await self._finish_dead(agent, task, pane)
         return await self._check_health(agent, task)
+
+    #: How long a dead pane may go without tmux saying how it ended before it
+    #: is finalized anyway. It is milliseconds in practice; this bounds a tmux
+    #: that never says, so no agent is held forever waiting for it.
+    EXIT_STATUS_GRACE = timedelta(seconds=10)
+
+    async def _finish_dead(self, agent: Agent, task: TaskSpec, pane: PaneStatus) -> list[Event]:
+        """Finalize a dead pane - once it is known how it ended.
+
+        tmux marks a pane dead when its terminal closes, which can be before
+        it has reaped the process and so before `pane_dead_status` exists.
+        Measured on Linux: dead, no status, no signal, for one poll. Finalized
+        then, a task that succeeded was recorded as an error. So an unknown
+        outcome waits, briefly, for tmux to catch up.
+        """
+        code = self._exit_code(agent, task, pane)
+        if code is None:
+            first = self._dead_since.setdefault(agent.name, self.now())
+            if self.now() - first < self.EXIT_STATUS_GRACE:
+                return []
+        return [await self._finalize(agent, task, code)]
 
     #: A process killed by signal N exits, by shell convention, with 128 + N.
     SIGNAL_EXIT_BASE = 128
@@ -1074,7 +1103,7 @@ class AgentManager:
                 self.store.save_run(run)
             self.store.set_task_state(task.id, TaskState.ERROR)
             self.store.remove_agent(agent.name)
-        self._log_sizes.pop(agent.name, None)
+        self._forget(agent.name)
         return [
             TaskFinished(
                 at=self.now(),
@@ -1124,7 +1153,7 @@ class AgentManager:
             elif pane is None or not pane.exists:
                 events.extend(await self._handle_missing_window(agent, task))
             elif pane.dead:
-                events.append(await self._finalize(agent, task, self._exit_code(agent, task, pane)))
+                events.extend(await self._finish_dead(agent, task, pane))
             else:
                 # Alive: resume monitoring, and make sure the log pipe is open
                 # so the next tick's stall detection has something to read.
@@ -1346,7 +1375,7 @@ class AgentManager:
             if task is not None:
                 self.store.set_task_state(task.id, TaskState.KILLED)
             self.store.remove_agent(agent.name)
-        self._log_sizes.pop(agent.name, None)
+        self._forget(agent.name)
         if task is not None:
             events.append(
                 TaskFinished(

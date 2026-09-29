@@ -134,7 +134,7 @@ async def test_pane_goes_dead_and_reports_its_exit_code(
     run = make_run(tmp_path)
     await runner.spawn("scout", run, script(tmp_path, f"echo working; exit {exit_code}"))
 
-    status = await wait_for(lambda: _dead(runner, "scout"))
+    status = await wait_for(lambda: _finished(runner, "scout"))
     assert status.dead
     assert status.exit_code == exit_code
 
@@ -147,7 +147,7 @@ async def test_a_pane_killed_by_a_signal_reports_the_signal_not_a_status(
     arrives."""
     await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "kill -TERM $$; sleep 5"))
 
-    status = await wait_for(lambda: _dead(runner, "scout"))
+    status = await wait_for(lambda: _finished(runner, "scout"))
 
     assert status.exit_code is None
     assert status.signal == signal.SIGTERM
@@ -156,6 +156,14 @@ async def test_a_pane_killed_by_a_signal_reports_the_signal_not_a_status(
 async def _dead(runner: TmuxRunner, agent: str) -> PaneStatus | None:
     status = await runner.status(agent)
     return status if status.dead else None
+
+
+async def _finished(runner: TmuxRunner, agent: str) -> PaneStatus | None:
+    """Dead, and tmux has said how: an exit status or a signal. On Linux
+    `pane_dead` can come a poll before either - measured on CI."""
+    status = await runner.status(agent)
+    known = status.exit_code is not None or status.signal is not None
+    return status if status.dead and known else None
 
 
 async def test_a_running_pane_reports_alive_with_no_exit_code(runner: TmuxRunner, tmp_path: Path):
