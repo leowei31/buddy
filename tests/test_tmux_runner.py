@@ -13,6 +13,7 @@ import inspect
 import os
 import shutil
 import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -134,8 +135,7 @@ async def test_pane_goes_dead_and_reports_its_exit_code(
     run = make_run(tmp_path)
     await runner.spawn("scout", run, script(tmp_path, f"echo working; exit {exit_code}"))
 
-    status = await wait_for(lambda: _finished(runner, "scout"))
-    assert status.dead
+    status = await wait_for(lambda: _dead(runner, "scout"))
     assert status.exit_code == exit_code
 
 
@@ -147,10 +147,30 @@ async def test_a_pane_killed_by_a_signal_reports_the_signal_not_a_status(
     arrives."""
     await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "kill -TERM $$; sleep 5"))
 
-    status = await wait_for(lambda: _finished(runner, "scout"))
+    status = await wait_for(lambda: _dead(runner, "scout"))
 
     assert status.exit_code is None
     assert status.signal == signal.SIGTERM
+
+
+async def test_the_task_runs_under_bash_whatever_the_login_shell(
+    runner: TmuxRunner, tmp_path: Path
+):
+    """tmux runs a one-string command through `default-shell -c`. A shell
+    that runs startup code and does not exec its last command - as `sh`
+    need not - would then be what tmux reports on, not the task."""
+    ran = tmp_path / "login-shell-ran"
+    shell = tmp_path / "shell"
+    shell.write_text(f'#!/bin/sh\ntouch {ran}\n/bin/sh "$@"\n')
+    shell.chmod(0o755)
+    await runner.open_window("scout")
+    await runner._tmux("set-option", "-g", "default-shell", str(shell))
+
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "kill -TERM $$; sleep 5"))
+
+    status = await wait_for(lambda: _dead(runner, "scout"))
+    assert status.signal == signal.SIGTERM
+    assert not ran.exists()
 
 
 async def _dead(runner: TmuxRunner, agent: str) -> PaneStatus | None:
@@ -158,12 +178,96 @@ async def _dead(runner: TmuxRunner, agent: str) -> PaneStatus | None:
     return status if status.dead else None
 
 
-async def _finished(runner: TmuxRunner, agent: str) -> PaneStatus | None:
-    """Dead, and tmux has said how: an exit status or a signal. On Linux
-    `pane_dead` can come a poll before either - measured on CI."""
-    status = await runner.status(agent)
-    known = status.exit_code is not None or status.signal is not None
-    return status if status.dead and known else None
+async def test_a_dead_pane_always_says_how_it_ended(runner: TmuxRunner, tmp_path: Path):
+    """Ubuntu's tmux can lose the `SIGCHLD` of a pane whose terminal closed
+    a moment before it exited, and then reports it dead with no status
+    (see `_remind_to_reap`). A process that closes its terminal first is
+    the shape that loses it; on ubuntu:24.04 one in a dozen or so did. A
+    tmux that never loses it passes this trivially."""
+    body = script(tmp_path, "exec </dev/null >/dev/null 2>&1; exit 3")
+    for attempt in range(1, 25):
+        await runner.spawn("scout", make_run(tmp_path, attempt=attempt), body)
+
+        status = await wait_for(lambda: _dead(runner, "scout"))
+
+        assert status.exit_code == 3, f"attempt {attempt}: {status}"
+
+
+class ScriptedTmux(TmuxRunner):
+    """Answers `list-panes` from a script, one reply per call, and fails on
+    a call it has no reply for."""
+
+    def __init__(self, *replies: str):
+        super().__init__(session="buddy-test", socket_name="scripted")
+        self.replies = list(replies)
+
+    async def session_exists(self) -> bool:
+        return True
+
+    async def _call(self, *args: str) -> tuple[int, str, str]:
+        assert args[0] == "list-panes", args
+        return 0, self.replies.pop(0), ""
+
+
+#: Stands in for a tmux server: says when it is ready, then reports the
+#: `SIGCHLD` it is sent.
+SIGCHLD_CATCHER = """
+import signal, sys, time
+def caught(*_):
+    print("SIGCHLD", flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGCHLD, caught)
+print("ready", flush=True)
+time.sleep(30)
+"""
+
+
+@contextlib.asynccontextmanager
+async def stand_in_server():
+    server = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", SIGCHLD_CATCHER, stdout=asyncio.subprocess.PIPE
+    )
+    try:
+        assert server.stdout is not None
+        assert await server.stdout.readline() == b"ready\n"
+        yield server
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            server.kill()
+        await server.wait()
+
+
+def pane_line(server_pid: int, dead: str = "1", status: str = "", signal_name: str = "") -> str:
+    return f"scout\t{dead}\t{status}\t4242\t1\t1\t{signal_name}\t{server_pid}\n"
+
+
+async def test_a_dead_pane_with_no_status_reminds_tmux_to_reap():
+    """The one test here against a stand-in: a lost `SIGCHLD` cannot be
+    staged on demand, so this proves the reminder is sent, to the server
+    that reported the pane, and that the second look is what is returned."""
+    async with stand_in_server() as server:
+        runner = ScriptedTmux(pane_line(server.pid), pane_line(server.pid, status="0"))
+
+        status = await runner.status("scout")
+
+        assert status.exit_code == 0
+        assert server.stdout is not None
+        assert await asyncio.wait_for(server.stdout.readline(), 5) == b"SIGCHLD\n"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"status": "3"}, {"signal_name": "term"}, {"dead": "0"}],
+    ids=["exited", "signalled", "alive"],
+)
+async def test_a_pane_that_needs_no_reaping_is_read_once(fields: dict[str, str]):
+    """One reply is scripted, so a second look would fail the test."""
+    async with stand_in_server() as server:
+        runner = ScriptedTmux(pane_line(server.pid, **fields))
+
+        await runner.status("scout")
+
+        assert server.returncode is None
 
 
 async def test_a_running_pane_reports_alive_with_no_exit_code(runner: TmuxRunner, tmp_path: Path):
@@ -317,17 +421,32 @@ async def test_kill_takes_the_whole_process_tree(runner: TmuxRunner, tmp_path: P
     await runner.kill("builder")
 
     for pid in (child, grandchild, shell):
-        await wait_for(lambda pid=pid: not _pid_alive(pid), seconds=15)
+        await wait_for(lambda pid=pid: _gone(pid), seconds=15)
 
 
-def _pid_alive(pid: int) -> bool:
+async def _gone(pid: int) -> bool:
+    """Not running: absent, or a zombie - exited, with only its parent's
+    bookkeeping left, which in a container whose init reaps nothing is
+    where an orphan stays."""
+    state = _proc_state(pid)
+    if state is None:
+        proc = await asyncio.create_subprocess_exec(
+            "ps", "-o", "stat=", "-p", str(pid), stdout=asyncio.subprocess.PIPE
+        )
+        out, _ = await proc.communicate()
+        state = out.decode().strip()
+    return not state or state.startswith("Z")
+
+
+def _proc_state(pid: int) -> str | None:
+    """The state letter from `/proc`, "" for a pid that is gone, None where
+    there is no `/proc` to ask."""
+    if not Path("/proc").is_dir():
+        return None
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        return Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2][:1]
+    except OSError:
+        return ""
 
 
 async def test_kill_removes_the_agents_window(runner: TmuxRunner, tmp_path: Path):
@@ -402,6 +521,23 @@ def test_children_are_read_from_proc_where_there_is_one(tmp_path: Path):
     assert children_from_proc(10, tmp_path) == [11, 12]
     assert children_from_proc(11, tmp_path) == [13]
     assert children_from_proc(13, tmp_path) == []
+
+
+def test_a_zombie_is_not_running(tmp_path: Path):
+    """An exited process its parent has not reaped yet is a zombie, and
+    waiting for one to die cost `kill` its whole grace period."""
+    from buddy.tmux_runner import running_from_proc
+
+    for pid, state in [(20, "S"), (21, "R"), (22, "Z"), (23, "X")]:
+        entry = tmp_path / str(pid)
+        entry.mkdir()
+        (entry / "stat").write_text(f"{pid} (a name (odd) ) {state} 1 0 0 0 -1 0 0 0\n")
+
+    assert running_from_proc(20, tmp_path)
+    assert running_from_proc(21, tmp_path)
+    assert not running_from_proc(22, tmp_path)
+    assert not running_from_proc(23, tmp_path)
+    assert not running_from_proc(24, tmp_path)  # gone altogether
 
 
 @pytest.mark.skipif(shutil.which("ps") is None, reason="no ps either; /proc is the only way here")

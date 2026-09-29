@@ -139,7 +139,7 @@ async def test_a_run_that_finished_while_buddy_was_down_is_finalized(
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    pane = await wait_for(lambda: _finished(first, task.agent))
+    pane = await wait_for(lambda: _dead(first, task.agent))
     first.close()
 
     second = Buddy(config, socket)
@@ -162,13 +162,9 @@ def evidence(config: Config, task: TaskSpec, pane=None) -> str:
     return f"pane={pane!r}\nlog:\n{text[-1500:]}"
 
 
-async def _finished(buddy: Buddy, agent: str):
-    """Dead, and tmux has said how it ended - as it long since has by the time
-    a Buddy that was down comes back. On Linux `pane_dead` can come a poll
-    before the status does."""
+async def _dead(buddy: Buddy, agent: str):
     status = await buddy.runner.status(agent)
-    known = status.exit_code is not None or status.signal is not None
-    return status if status.dead and known else None
+    return status if status.dead else None
 
 
 async def test_a_failed_run_is_finalized_as_an_error(tmp_path: Path, repo: Path, socket: str):
@@ -176,7 +172,7 @@ async def test_a_failed_run_is_finalized_as_an_error(tmp_path: Path, repo: Path,
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    pane = await wait_for(lambda: _finished(first, task.agent))
+    pane = await wait_for(lambda: _dead(first, task.agent))
     first.close()
 
     second = Buddy(config, socket)
@@ -377,7 +373,7 @@ async def test_reconcile_is_idempotent(tmp_path: Path, repo: Path, socket: str):
     buddy = Buddy(config, socket)
     task = make_task(buddy.store)
     await buddy.manager.submit(task)
-    await wait_for(lambda: _finished(buddy, task.agent))
+    await wait_for(lambda: _dead(buddy, task.agent))
 
     await buddy.manager.reconcile()
     state = buddy.store.get_task_state(task.id)

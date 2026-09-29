@@ -967,11 +967,11 @@ class AgentManager:
     async def _finish_dead(self, agent: Agent, task: TaskSpec, pane: PaneStatus) -> list[Event]:
         """Finalize a dead pane - once it is known how it ended.
 
-        tmux marks a pane dead when its terminal closes, which can be before
-        it has reaped the process and so before `pane_dead_status` exists.
-        Measured on Linux: dead, no status, no signal, for one poll. Finalized
-        then, a task that succeeded was recorded as an error. So an unknown
-        outcome waits, briefly, for tmux to catch up.
+        tmux marks a pane dead when its terminal closes, and learns the exit
+        status only when it reaps the process - which Ubuntu's tmux can fail
+        to do (see `tmux_runner._remind_to_reap`). Finalized with no status,
+        a task that succeeded was recorded as an error. So an unknown outcome
+        waits, briefly, for tmux to catch up.
         """
         code = self._exit_code(agent, task, pane)
         if code is None:
@@ -986,11 +986,10 @@ class AgentManager:
     def _exit_code(self, agent: Agent, task: TaskSpec, pane: PaneStatus) -> int | None:
         """How a dead pane's attempt ended.
 
-        tmux's own status first. It has none for a process killed by a signal
-        - measured on Linux, where a finished task was recorded as an error
-        with exit code -1 - so next the wrapper's `__BUDDY_DONE__` line, which
-        carries the harness's exit code and exists for exactly this, and last
-        the signal itself, as a shell would report it.
+        tmux's own status first. It has none for a process killed by a signal,
+        nor for one it has not reaped, so next the wrapper's `__BUDDY_DONE__`
+        line, which carries the harness's exit code and exists for exactly
+        this, and last the signal itself, as a shell would report it.
         """
         if pane.exit_code is not None:
             return pane.exit_code

@@ -105,6 +105,10 @@ Details that only appeared against real tmux:
 
 - A tmux session ends with its last window, and the server with its last session. So there is no window to keep and nothing to create up front: the first agent brings the session, and closing a pipe on a window that has gone - with the server gone too - is a no-op rather than an error.
 - `remain-on-exit` is set on every spawn, not only when Buddy makes the window, because a window made by hand does not have it and its exit status would be lost.
+- Debian and Ubuntu build tmux with libutempter, which resets the `SIGCHLD` handler while a pane's terminal closes, so tmux can miss that the pane's process exited and report a dead pane with no status.
+  A dead pane that has not said how it ended gets tmux a `SIGCHLD`, which makes it reap the process, and a second look.
+- The script is handed to `respawn-window` as separate arguments, so tmux execs bash itself.
+  Given one string, tmux would run it through your login shell, whose startup files would run first and which could stand between tmux and the task - and then be what tmux reports on.
 - `#{pane_pipe}` reports that *a* pipe exists, never where it points, so a retry that reuses its window re-opens the pipe unconditionally.
 - `display -p -t <session>:<window>` silently answers for the session's *current* window when the target does not resolve, so it can never prove a window exists. Enumerating `list-panes -s` can, and hands over every agent's pane in one call.
 - Every target is `session:=name`. Without the `=`, tmux matches a prefix, and `scout` would act on `scout-2`.

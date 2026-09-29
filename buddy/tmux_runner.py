@@ -9,7 +9,8 @@ Three mechanisms carry the whole design and are verified by
 
 * `remain-on-exit on` keeps a pane after its command exits, so tmux retains
   the exit status and the final output stays on screen.
-* `#{pane_dead}` + `#{pane_dead_status}` is the completion signal.
+* `#{pane_dead}` + `#{pane_dead_status}` is the completion signal, with a
+  reminder for the tmux builds that can lose it (`_remind_to_reap`).
 * `pipe-pane` streams the pane into an append-only log that outlives the
   pane and tmux's scrollback.
 """
@@ -275,19 +276,19 @@ class TmuxRunner:
         `script` is the generated wrapper. It is passed in rather than
         derived, because where it lives is layout knowledge that belongs to
         `config.Paths`, not to the module that knows tmux.
+
+        Given as separate arguments, so tmux execs bash itself. A single
+        string would go through the user's `$SHELL -c`, whose startup files
+        then run first and which, unless it happens to exec its last
+        command, sits between tmux and the task: it is what tmux would then
+        report on - a task killed by a signal read as exit 143 under `sh`.
         """
         await self.open_window(agent)
         # Both pipe calls are no-ops when the window's previous pane is dead,
         # which is the ordinary case for a window left by an earlier attempt.
         await self.close_pipe(agent)
         await self.open_pipe(agent, run.log_path)
-        await self._tmux(
-            "respawn-window",
-            "-k",
-            "-t",
-            self.target(agent),
-            f"bash {shlex.quote(str(script))}",
-        )
+        await self._tmux("respawn-window", "-k", "-t", self.target(agent), "bash", str(script))
         # Re-opened, because of what `#{pane_pipe}` can actually tell
         # us: it reports that *a* pipe exists, never where it points. A window
         # being reused still carries the previous attempt's pipe, so checking
@@ -311,9 +312,20 @@ class TmuxRunner:
         the name exactly is the only reliable answer.
 
         One call for every agent is also what the manager's 1s tick wants.
+
+        A dead pane that has not said how it ended gets tmux a `SIGCHLD` and
+        a second look - see `_remind_to_reap` for the tmux that needs it.
         """
+        found, server_pid = await self._list_panes()
+        if server_pid and any(_untold(pane) for pane in found.values()):
+            _remind_to_reap(server_pid)
+            found, _ = await self._list_panes()
+        return found
+
+    async def _list_panes(self) -> tuple[dict[str, PaneStatus], int | None]:
+        """The panes, and the pid of the tmux server that reported them."""
         if not await self.session_exists():
-            return {}
+            return {}, None
         code, out, _ = await self._call(
             "list-panes",
             "-s",
@@ -321,11 +333,12 @@ class TmuxRunner:
             self._session_target,
             "-F",
             "#{window_name}\t#{pane_dead}\t#{pane_dead_status}\t"
-            "#{pane_pid}\t#{pane_pipe}\t#{pane_active}\t#{pane_dead_signal}",
+            "#{pane_pid}\t#{pane_pipe}\t#{pane_active}\t#{pane_dead_signal}\t#{pid}",
         )
         if code != 0:
-            return {}
+            return {}, None
         found: dict[str, PaneStatus] = {}
+        server_pid: int | None = None
         for line in out.splitlines():
             parts = line.split("\t")
             if len(parts) < 6:
@@ -333,6 +346,8 @@ class TmuxRunner:
             name, dead_raw, status_raw, pid_raw, pipe_raw, active_raw = parts[:6]
             # Empty before tmux 3.2, which had no such format.
             signal_raw = parts[6] if len(parts) > 6 else ""
+            if len(parts) > 7 and parts[7].isdigit():
+                server_pid = int(parts[7])
             # Buddy gives a window exactly one pane, but a curious user can
             # split one by hand; the active pane is the task's.
             if name in found and active_raw != "1":
@@ -348,7 +363,7 @@ class TmuxRunner:
                 piped=pipe_raw == "1",
                 signal=_signal_number(signal_raw) if dead else None,
             )
-        return found
+        return found, server_pid
 
     async def status(self, agent: str) -> PaneStatus:
         """The completion signal. Never scrapes text."""
@@ -372,6 +387,32 @@ class TmuxRunner:
         if status.pid and not status.dead:
             await kill_process_tree(status.pid, grace=KILL_GRACE_SECONDS)
         await self.close_window(agent)
+
+
+def _untold(pane: PaneStatus) -> bool:
+    """Dead, with neither an exit status nor a signal to say how."""
+    return pane.dead and pane.exit_code is None and pane.signal is None
+
+
+def _remind_to_reap(server_pid: int) -> None:
+    """Send the tmux server the `SIGCHLD` it may have lost.
+
+    Debian and Ubuntu build tmux with libutempter. When a pane's terminal
+    closes, tmux calls `utempter_remove_record`, which sets `SIGCHLD` to
+    `SIG_DFL` while its helper runs - and a signal arriving then is
+    discarded. A pane process that finishes exiting in that window is never
+    reaped, so the pane reads dead with no `pane_dead_status` until some
+    other child of the server happens to exit. tmux closes the same gap
+    after `utempter_add_record` with `kill(getpid(), SIGCHLD)`; 3.4 does not
+    after the removal. Reproduced on ubuntu:24.04: a pane that closed its
+    terminal just before exiting lost its status about one time in twelve,
+    and this signal brought it back at once.
+
+    All the signal does is run tmux's `waitpid(WNOHANG)` loop, so a spare
+    one costs nothing.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(server_pid, signal.SIGCHLD)
 
 
 def _signal_number(raw: str) -> int | None:
@@ -471,7 +512,28 @@ async def process_tree(pid: int) -> list[int]:
     return found
 
 
+def running_from_proc(pid: int, root: Path = PROC) -> bool:
+    """Whether `pid` is still running, read from `/proc`.
+
+    A zombie is not: it has exited, and only its parent's bookkeeping is
+    left. Counted as a survivor, one cost `kill` its whole grace period
+    whenever the parent was slow to reap - tmux after a lost `SIGCHLD` (see
+    `_remind_to_reap`), or a container whose init reaps nothing. Found
+    running the suite on ubuntu:24.04.
+    """
+    try:
+        stat = (root / str(pid) / "stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return True  # there, but unreadable: assume the worst
+    _, _, rest = stat.rpartition(") ")
+    return rest[:1] not in ("Z", "X")
+
+
 def _alive(pid: int) -> bool:
+    if HAS_PROC:
+        return running_from_proc(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -479,6 +541,10 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _survivors(pids: list[int]) -> list[int]:
+    return [pid for pid in pids if _alive(pid)]
 
 
 def _signal(pid: int, sig: signal.Signals) -> None:
@@ -503,13 +569,12 @@ async def kill_process_tree(pid: int, *, grace: float = KILL_GRACE_SECONDS) -> N
 
     deadline = asyncio.get_running_loop().time() + grace
     while asyncio.get_running_loop().time() < deadline:
-        if not any(_alive(target) for target in pids):
+        if not await asyncio.to_thread(_survivors, pids):
             return
         await asyncio.sleep(0.1)
 
-    for target in pids:
-        if _alive(target):
-            _signal(target, signal.SIGKILL)
+    for target in await asyncio.to_thread(_survivors, pids):
+        _signal(target, signal.SIGKILL)
     if group:
         _signal(-group, signal.SIGKILL)
 
