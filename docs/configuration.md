@@ -193,7 +193,7 @@ The image carries no credentials; give the container a key through `[harness.<na
 
 ### `[harness.<name>.env]`
 
-Environment for the generated `run.sh`, which is mode `0600` and deleted once the attempt's result is written.
+Environment for the generated `run.sh`, which is mode `0600` and deleted the moment the attempt ends, however it ends.
 `buddy doctor` and preflight's sign-in checks run with it too, so a key that lives only here still counts as signed in.
 
 ```toml
@@ -313,7 +313,7 @@ The directory itself is mode `0700`, and an older install is tightened on the ne
 | `tasks/<id>/attempt-N.log` | Raw pane output, escapes and all, mode `0600`. |
 | `tasks/<id>/attempt-N.log.1` | The previous part of that log, once it passed `max_log_mb`. |
 | `tasks/<id>/result.json` | The parsed outcome of the last attempt. |
-| `tasks/<id>/run.sh` | The generated wrapper, mode `0600`, deleted once the result is written. |
+| `tasks/<id>/run.sh` | The generated wrapper, mode `0600`, deleted the moment the attempt ends. |
 | `worktrees/<project>/<id>/` | The task's checkout. Disposable: the branch is the work. |
 | `setup.lock` | What each setup step settled on, so `buddy update` knows what moved. |
 | `platform.json` | What setup detected about this machine. |

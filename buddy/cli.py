@@ -1724,9 +1724,28 @@ def update() -> None:
     raise SystemExit(asyncio.run(_update()))
 
 
+def _source_checkout() -> Path | None:
+    """The git checkout Buddy is running from, if it is one - the install the
+    README describes - or None for an installed tool."""
+    root = Path(__file__).resolve().parent.parent
+    if (root / "pyproject.toml").is_file() and (root / ".git").exists():
+        return root
+    return None
+
+
 async def _update() -> int:
-    tool = shutil.which("uv")
-    if tool:
+    checkout = _source_checkout()
+    if checkout is not None:
+        # `uv tool upgrade` cannot touch a clone. Asked anyway, it failed and
+        # told the user to `uv tool install` a package that is not published.
+        where = escape(shlex.quote(str(checkout)))
+        console.print(
+            f"[bold]Running from a checkout[/] - update it with "
+            f"[bold]cd {where} && git pull && uv sync[/], then run buddy update again. "
+            "Re-checking the setup steps now.",
+            soft_wrap=True,
+        )
+    elif tool := shutil.which("uv"):
         console.print("[bold]Upgrading the tool[/] - uv tool upgrade buddy-orchestrator")
         proc = await asyncio.create_subprocess_exec(
             tool,
@@ -1742,8 +1761,7 @@ async def _update() -> int:
             release(proc)
         said = out.decode(errors="replace").strip()
         if proc.returncode != 0:
-            # Not fatal: a source checkout has no installed tool to upgrade,
-            # and re-running the steps is still worth doing.
+            # Not fatal: re-running the steps is still worth doing.
             last = said.splitlines()[-1] if said else "upgrade failed"
             console.print(f"[yellow]{escape(last)}[/]")
         elif said:

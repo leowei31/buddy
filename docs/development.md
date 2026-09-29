@@ -20,7 +20,7 @@ Tests that need an optional extra skip without it rather than erroring, so a par
 ## The testing stance
 
 The suite drives **real** tmux, real git, real SQLite, a real HTTP server and real subprocesses.
-Hand-written fakes stand in where an external service would cost money or reach off the machine; `unittest.mock` is not used.
+Hand-written fakes stand in where an external service would cost money or reach off the machine, or where a failure cannot be staged on demand; `unittest.mock` is not used.
 
 That is deliberate.
 Nearly every serious bug found in this project lived in a **seam** - between an LLM's output and a shell, between one agent's failure and every other, between a kill and a database write, between a key in a keychain and a client that only read the environment.
@@ -30,7 +30,8 @@ Mock-heavy tests pass straight through seams.
 |---|---|---|
 | `test_manager.py` | Scheduling, dependencies, preemption, health, crash paths | Fake runner and workspace, injected clock |
 | `test_reconcile.py` | Recovery after a crash | **Real tmux, real git** - kills the server mid-run |
-| `test_tmux_runner.py` | Panes, pipes, process-tree kill | **Real tmux** |
+| `test_tmux_runner.py` | Panes, pipes, process-tree kill, a lost `SIGCHLD` | **Real tmux**; a scripted one for the lost signal, which cannot be staged |
+| `test_processes.py` | A killed subprocess is reaped within a bound, even one that never exits | Real processes, and a stand-in for one that never exits |
 | `test_workspace.py` | Worktrees, checkpoints, merge, conflict | **Real git** |
 | `test_shutdown.py` | What survives a shutdown | **Real git** |
 | `test_web.py` | The dashboard | **Real uvicorn on a real socket** |
@@ -51,6 +52,7 @@ Mock-heavy tests pass straight through seams.
 Async tests need no decorator - `asyncio_mode = "auto"`.
 `filterwarnings = ["error"]`, so a new deprecation fails the suite.
 `timeout = 120` per test, because a hang is a bug and "CI never finished" is the worst way to learn that.
+On CI, each failing test is also written out as an annotation on the commit, with the end of its traceback: a run's logs need a GitHub sign-in to read, and its annotations do not.
 
 Each tmux-facing test gets a **private socket** via the `tmux_socket` fixture, so a test run can never disturb your own `buddy` session.
 

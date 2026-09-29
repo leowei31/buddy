@@ -219,7 +219,7 @@ class BuddySection:
     stall_timeout: timedelta = timedelta(minutes=10)
     max_runtime: timedelta = timedelta(hours=2)
     web_port: int = 4321
-    trust_mode: bool = False  # true = no spoken read-back on spawn
+    trust_mode: bool = False  # true = no confirmation for anything
     # A discarded task's branch is kept this long before it is pruned.
     discard_grace: timedelta = timedelta(days=7)
     #: An attempt's log is rotated past this many MiB, keeping one previous

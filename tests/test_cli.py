@@ -18,6 +18,9 @@ from buddy.cli import app
 
 runner = CliRunner()
 
+#: The checkout this suite runs from.
+CHECKOUT = Path(__file__).resolve().parent.parent
+
 
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch) -> Path:
@@ -263,6 +266,28 @@ def test_setup_refuses_an_unknown_step_and_lists_the_real_ones(home: Path):
     assert "unknown step" in result.stdout
     for step in ("platform", "keys", "config", "doctor"):
         assert step in result.stdout
+
+
+async def test_update_in_a_checkout_says_how_to_update_it(monkeypatch, capsys):
+    """The README installs Buddy as a clone, which `uv tool upgrade` cannot
+    touch: asked anyway, it failed and told the user to `uv tool install` a
+    package that is not published."""
+    from buddy import cli
+
+    assert cli._source_checkout() == CHECKOUT
+    asked: list[str] = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: asked.append(name))
+
+    async def settled(**_: object) -> int:
+        return 0
+
+    monkeypatch.setattr(cli, "_setup", settled)
+
+    assert await cli._update() == 0
+
+    printed = capsys.readouterr().out
+    assert f"cd {CHECKOUT} && git pull && uv sync" in printed
+    assert "uv" not in asked, "a checkout has no tool to upgrade"
 
 
 async def test_purge_refuses_while_a_branch_still_holds_work(home: Path, monkeypatch, capsys):

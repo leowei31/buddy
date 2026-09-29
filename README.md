@@ -58,6 +58,7 @@ buddy setup
 ```
 
 The link runs Buddy from this checkout, in the environment `uv sync` built from `uv.lock`, so what you run is what the test suite ran.
+To update it later, `git pull && uv sync` in the checkout, then `buddy update` to re-run only the setup steps that changed.
 (`uv tool install` is not recommended: it ignores the lockfile, and picks the newest Python, where the voice extra has no wheels yet.)
 
 Setup is twelve steps, each `check -> act -> verify`.

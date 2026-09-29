@@ -36,7 +36,7 @@ They are in tmux, which is the entire point of putting them there.
 | `buddy reprioritize <task_id> <N>` | Reorder the queue. Not confirmed - it is reversible. |
 | `buddy kill <agent> [--yes]` | Stop an agent. Its work is checkpointed, the task is marked killed, and it does **not** come back. |
 | `buddy diff <task_id> [--into BRANCH]` | What that task's branch changed. |
-| `buddy merge <task_id> [--into BRANCH] [--yes] [--force] [--allow-secret-patterns]` | `--no-ff` into your checkout. Refuses while the task's agent is still running, have uncommitted changes, a [conflict fix](#when-a-merge-conflicts) is pending (`--force` overrides), or the branch adds a [secret](#secrets) (`--allow-secret-patterns` lets checked lookalikes through, never your own keys). A conflict is aborted and reported. |
+| `buddy merge <task_id> [--into BRANCH] [--yes] [--force] [--allow-secret-patterns]` | `--no-ff` into your checkout. Refused while the task's agent is still running, while your checkout has uncommitted changes, while a [conflict fix](#when-a-merge-conflicts) is pending (`--force` overrides), and when the branch adds a [secret](#secrets) (`--allow-secret-patterns` lets checked lookalikes through, never your own keys). A conflict is aborted and reported. |
 | `buddy resolve <task_id> [--harness H] [--wait]` | Spawn an agent to resolve that task's merge conflict. |
 | `buddy discard <task_id> [--yes]` | Remove the worktree. The branch is kept for [the grace period](#discarding). Refused while the task's agent is still running. |
 
@@ -58,7 +58,7 @@ They are in tmux, which is the entire point of putting them there.
 | `buddy config edit` | Open it in `$VISUAL` or `$EDITOR`, then check what you saved; a mistake is shown the moment you close the editor. |
 | `buddy config path` | Just the path, for scripts: `$EDITOR "$(buddy config path)"`. |
 | `buddy --version` | The installed version. |
-| `buddy update` | Upgrade the tool, then re-run only the steps whose pins moved. |
+| `buddy update` | Upgrade the tool, then re-run only the setup steps whose pins moved. Run from a clone - the [install](../README.md#install) the README describes - there is no tool to upgrade, so it says to `git pull && uv sync` in the checkout first. |
 | `buddy shutdown [--yes] [--keep-worktrees]` | Stop every agent, clear the worktrees, keep the work. |
 | `buddy uninstall [--purge] [--force]` | Remove the container, session and tool. `--purge` also deletes `~/.buddy`, and refuses while any branch holds unmerged work; `--force` purges anyway, unrecoverably. |
 
@@ -441,7 +441,7 @@ What is not there yet, or not proven.
 | Gap | Consequence |
 |---|---|
 | Antigravity's success path is unverified | Every failure path was run for real; a successful run's output was not, because it needs a Google account. `parse_result` trusts the exit code over anything unexpected. |
-| The container sandbox is tested only where Docker runs | The sandbox tests skip without a Docker daemon, and CI has none. |
+| The container sandbox is tested only where Docker runs | The sandbox tests skip without a Docker daemon - on the macOS CI runners, for one - and those that need git inside the container skip unless `BUDDY_TEST_IMAGE` names an image that has it. |
 | An outside tool holding `state.db`'s write lock stalls the session | Measured: Buddy's own processes never block each other for more than a couple of milliseconds, but a tool of yours holding a write transaction open freezes the tick for as long as it holds it. |
 | A log line straddling `max_log_mb` is split across two files | Nothing is lost; the two files concatenate back exactly. |
 | Voice falls back only at the same sample rate | Playback is opened for the primary backend's rate. |

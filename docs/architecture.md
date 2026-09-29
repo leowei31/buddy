@@ -58,6 +58,8 @@ buddy/
   manager.py        agents and their names, priority, dependencies, preemption, health, recovery
   workspace.py      worktrees, branches, checkpoint, merge, discard
   tmux_runner.py    session and windows, respawn, pipe-pane, process-tree kill
+  sandbox.py        the container boundary: what `docker run` is given, and nothing more
+  processes.py      subprocesses that release their pipes and are reaped within a bound
   state.py          SQLite (WAL)
   config.py         config.toml, secret resolution, the ~/.buddy layout
   models.py         the vocabularies: AgentStatus, TaskState, RunOutcome, events; agent names
@@ -65,6 +67,7 @@ buddy/
   logpipe.py        the pipe-pane target: appends a pane's output, rotates it losslessly
   leaks.py          recognising secrets, before a checkpoint, a merge or a commit
   control.py        the unix socket the overlay types through
+  overlay.py        the always-on-top panel, in its own process
   providers/        base.py + one module per LLM API
   harnesses/        the registry, base.py, stream.py, and one module per coding-agent CLI
   voice/            stt.py (recognition, microphone), tts.py (Fish), session.py
@@ -99,7 +102,8 @@ Windows are created with `remain-on-exit on`, so a finished process leaves a **d
 Polling `#{pane_dead}` and `#{pane_dead_status}` is how Buddy knows a task ended, and the status survives Buddy being dead at the time.
 
 The wrapper script also writes `__BUDDY_START__` and `__BUDDY_DONE__` sentinels carrying the task id and exit code.
-Those are a **redundant record, never the signal** - and they are matched on task id, because a stale line in a log must never be read as this task's.
+Those are **never the signal** - a dead pane is - but they are the record of how a run ended when tmux has none: for a process a signal killed, for one tmux has not reaped, and for a window that is gone.
+They are matched on task id, because a stale line in a log must never be read as this task's.
 
 Details that only appeared against real tmux:
 
@@ -128,7 +132,7 @@ Buddy never sends a prompt through `send-keys`.
 It writes the brief to `prompt.md`, generates a `run.sh`, and the window runs the script.
 
 The prompt never touches a shell quoting layer; the script is always bash whatever your login shell is; and the log is self-describing.
-`run.sh` is mode `0600` because resolved secrets are exported in it, and it is deleted once the attempt's `result.json` is written.
+`run.sh` is mode `0600` because resolved secrets are exported in it, and it is deleted the moment the attempt ends, however it ends - before the checkpoint, so a checkpoint that fails cannot leave it behind.
 
 Every value substituted into the harness command line is `shlex.quote`d.
 That matters more than it looks: `model` is a free-text field an LLM sets, and the result is bash.
@@ -167,7 +171,7 @@ It never creates a window: a window that is missing is evidence, and recreating 
 |---|---|
 | Run **already has an outcome** | A crash came between ending the attempt and retiring its agent. Retire it; if the task still claims to be running, do what the outcome says - requeue, stay killed, or keep its verdict. |
 | Pane alive, run unfinished | Resume monitoring; re-open the log pipe if needed |
-| Pane dead | Finalize from its exit status, and close the window |
+| Pane dead | Finalize from how it ended - tmux's exit status, else the log's done sentinel, else the signal as `128 + N` - and close the window. With none of them yet, wait up to ten seconds for tmux, then record an error |
 | Window or session gone | Read the log's sentinels: finalize if they say it finished, otherwise checkpoint and requeue |
 
 The writes that end an attempt - the run's outcome, the task's state and the agent's row - go in one transaction, so a crash leaves either all of them or none.
@@ -176,7 +180,7 @@ The writes that end an attempt - the run's outcome, the task's state and the age
 
 An LLM with tools, a system prompt, and five layers of context management.
 
-Tools fall into four groups: manager tools (`spawn_agent`, `kill_agent`, `reprioritize`, `get_output`, `list_agents`, preemption answers), workspace tools (`propose_merge`, `resolve_conflict`, `discard_task`), brainstorming tools (`start_brainstorm`, `draft_brief`, `drop_draft`, `hand_off`), and a **read-only** project toolkit (`list_dir`, `read_file`, `grep`, `git_status`, `git_log`, `recent_tasks`) scoped to configured project roots.
+Tools fall into five groups: manager tools (`spawn_agent`, `kill_agent`, `reprioritize`, `get_output`, `list_agents`, preemption answers), workspace tools (`diff_summary`, `propose_merge`, `resolve_conflict`, `discard_task`), brainstorming tools (`start_brainstorm`, `draft_brief`, `drop_draft`, `hand_off`), memory tools (`recall`, `remember`, `forget`), and a **read-only** project toolkit (`list_dir`, `read_file`, `grep`, `git_status`, `git_log`, `recent_tasks`) scoped to configured project roots.
 
 Which tools the model is offered depends on the mode.
 While brainstorming, every tool that starts or changes work is withheld, and `call_tool` refuses one anyway; the mode's instructions travel in the per-turn state message rather than the system prompt, so switching modes keeps the cached prefix.
@@ -188,7 +192,7 @@ Confirmations are tiered: none for reversible things, a read-back for spawning, 
 
 The brain reads files, greps repositories and tails agent logs.
 Any of that can carry text someone else wrote.
-Two boundaries exist because of it:
+Four boundaries exist because of it:
 
 - **Tool arguments are validated before dispatch.** `model` must look like a model identifier; `priority` must be 1-5; `depends_on` must be a list. Without that, `depends_on="t-0007"` became six single-character dependencies and the task queued forever.
 - **Secrets are not readable.** `.env`, `.git/`, `.ssh/`, `*.pem`, `id_rsa` and friends are refused by `read_file`, `grep` and `list_dir` alike. Anything read here goes verbatim to a third-party API, into `state.db`, and back out through `recall` for the life of the project.
