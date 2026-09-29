@@ -21,7 +21,7 @@ from pathlib import Path
 from buddy import leaks
 from buddy.config import Config
 from buddy.models import RunOutcome, TaskRun, TaskSpec, utcnow
-from buddy.processes import release
+from buddy.processes import communicate
 
 #: Identity for the WIP commits Buddy makes on the harness's behalf.
 #: Explicit, so a repo with no configured user still checkpoints, and so the
@@ -99,10 +99,7 @@ async def git_version() -> tuple[int, ...]:
         )
     except (FileNotFoundError, PermissionError) as exc:
         raise WorkspaceError(f"git is not on PATH: {exc}") from exc
-    try:
-        out, err = await proc.communicate()
-    finally:
-        release(proc)
+    out, err = await communicate(proc)
     text = out.decode(errors="replace").strip()
     match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
     if proc.returncode != 0 or not match:
@@ -149,10 +146,7 @@ async def _run_git(
         stderr=asyncio.subprocess.PIPE,
         env={**os.environ, **GIT_ENV, **(env or {})},
     )
-    try:
-        out, err = await proc.communicate()
-    finally:
-        release(proc)
+    out, err = await communicate(proc)
     return (
         proc.returncode or 0,
         out.decode(errors="replace"),

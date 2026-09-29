@@ -20,7 +20,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from buddy.processes import kill_and_reap, release
+from buddy.processes import communicate
 
 #: Package managers, in the order they are looked for. The first one present
 #: wins; a machine with both `apt` and `snap` is an apt machine.
@@ -53,12 +53,9 @@ async def run(*args: str, seconds: float = 20.0) -> tuple[int, str, str]:
         return 127, "", str(exc)
     try:
         async with asyncio.timeout(seconds):
-            out, err = await proc.communicate()
+            out, err = await communicate(proc)
     except TimeoutError:
-        await kill_and_reap(proc)
         return 124, "", f"timed out after {seconds}s"
-    finally:
-        release(proc)
     return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
 

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from buddy.models import TaskRun
-from buddy.processes import release
+from buddy.processes import communicate
 
 #: tmux ≥ 3.0 is required for `pane_dead_status`.
 MIN_TMUX_VERSION = (3, 0)
@@ -104,10 +104,7 @@ class TmuxRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            out, err = await proc.communicate()
-        finally:
-            release(proc)
+        out, err = await communicate(proc)
         return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
     async def _tmux(self, *args: str) -> str:
@@ -497,11 +494,8 @@ async def _read(*args: str) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
     )
-    try:
-        out, err = await proc.communicate()
-    finally:
-        release(proc)
-    return proc.returncode or 0, out.decode(errors="replace"), (err or b"").decode(errors="replace")
+    out, err = await communicate(proc)
+    return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
 
 async def _children(pid: int) -> list[int]:

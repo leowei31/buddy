@@ -62,3 +62,24 @@ async def kill_and_reap(proc: Any, *, seconds: float = REAP_SECONDS) -> None:
     with contextlib.suppress(Exception):
         async with asyncio.timeout(seconds):
             await proc.wait()
+
+
+async def communicate(proc: Any) -> tuple[bytes, bytes]:
+    """`proc.communicate()`, with the pipes released however it ends - and,
+    when it is interrupted, the process killed and reaped before the
+    interruption carries on.
+
+    Cancelled mid-read, a process used to be left running with nothing
+    waiting on it: its pipes went unclosed, and `Popen` warned that it was
+    still running when it was collected - after the loop that could have
+    reaped it was gone. The session's tick, stopped at the end of a
+    conversation, was how - found hammering one test on Linux under load.
+    """
+    try:
+        out, err = await proc.communicate()
+    except BaseException:
+        await kill_and_reap(proc)
+        raise
+    finally:
+        release(proc)
+    return out or b"", err or b""

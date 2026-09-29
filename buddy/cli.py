@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -50,7 +50,7 @@ from buddy.models import (
     TaskState,
     utcnow,
 )
-from buddy.processes import release
+from buddy.processes import communicate
 from buddy.providers import KNOWN as KNOWN_PROVIDERS
 from buddy.providers import build as build_provider
 from buddy.providers.base import ProviderError, ProviderNotInstalled
@@ -181,34 +181,44 @@ async def _converse(runtime: Runtime, voice: bool = False, control=None) -> None
         console.print(f"[magenta]{_brainstorm_banner(brain)}[/]")
     speech = await _start_voice(runtime) if voice else None
     ticker = asyncio.create_task(_ticker(runtime))
+    # Closed here rather than whenever it is collected: its `finally` awaits
+    # the prompt it left standing, and that needs this loop to still be up.
+    utterances = contextlib.aclosing(_utterances(speech, control, label=lambda: _you(brain)))
     try:
-        async for utterance, asked in _utterances(speech, control, label=lambda: _you(brain)):
-            if asked is None and utterance.lower() in ("exit", "quit"):
-                break
-            if asked is not None:
-                # Shown in the terminal too, so the session is never a
-                # surface where things happen that you cannot see.
-                console.print(f"\n[dim]overlay>[/] {escape(utterance)}")
-            if utterance.startswith("/"):
-                said = await _command(brain, utterance)
-                console.print(escape(said))
+        async with utterances as heard:
+            async for utterance, asked in heard:
+                if asked is None and utterance.lower() in ("exit", "quit"):
+                    break
                 if asked is not None:
-                    asked.finish(said)
+                    # Shown in the terminal too, so the session is never a
+                    # surface where things happen that you cannot see.
+                    console.print(f"\n[dim]overlay>[/] {escape(utterance)}")
+                if utterance.startswith("/"):
+                    said = await _command(brain, utterance)
+                    console.print(escape(said))
+                    if asked is not None:
+                        asked.finish(said)
+                    _report_events(runtime, brain.pending_events)
+                    brain.pending_events.clear()
+                    continue
+                console.print("[dim]buddy>[/] ", end="")
+                reply = await _exchange(runtime, brain, speech, utterance, asked)
+                if reply is None:
+                    continue
+                if not reply:
+                    console.print("[dim](no reply)[/]")
                 _report_events(runtime, brain.pending_events)
                 brain.pending_events.clear()
-                continue
-            console.print("[dim]buddy>[/] ", end="")
-            reply = await _exchange(runtime, brain, speech, utterance, asked)
-            if reply is None:
-                continue
-            if not reply:
-                console.print("[dim](no reply)[/]")
-            _report_events(runtime, brain.pending_events)
-            brain.pending_events.clear()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        # Awaited, not only cancelled: a tick stopped mid-subprocess finishes
+        # closing that subprocess's pipes on this loop, which the caller is
+        # about to close. Left to itself it leaked them: 18 test runs in 240,
+        # under load on Linux.
         ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
         if speech is not None:
             await speech.stop()
     console.print(
@@ -318,7 +328,7 @@ async def _exchange(runtime: Runtime, brain, speech, utterance: str, asked=None)
 
 async def _utterances(
     speech, control=None, label: Callable[[], str] = lambda: "you"
-) -> AsyncIterator[tuple[str, Any]]:
+) -> AsyncGenerator[tuple[str, Any], None]:
     """What the user said, however they said it.
 
     Typed and spoken do not interleave - push-to-talk and `input()` both own
@@ -1756,10 +1766,7 @@ async def _update() -> int:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        try:
-            out, _ = await proc.communicate()
-        finally:
-            release(proc)
+        out, _ = await communicate(proc)
         said = out.decode(errors="replace").strip()
         if proc.returncode != 0:
             # Not fatal: re-running the steps is still worth doing.

@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import time
 
-from buddy.processes import REAP_SECONDS, kill_and_reap
+import pytest
+
+from buddy.processes import REAP_SECONDS, communicate, kill_and_reap
 
 
 class NeverReaps:
@@ -104,3 +106,21 @@ async def test_real_subprocess_that_ignores_sigterm_but_not_sigkill(tmp_path):
 
     assert proc.returncode is not None, "the process must actually be reaped"
     assert elapsed < 5.0, "SIGKILL cannot be trapped, so this must not need the fallback bound"
+
+
+async def test_a_read_that_is_cancelled_kills_and_reaps_the_process():
+    """Cancelled mid-read - the session's tick, stopped when a conversation
+    ended - a process was left running with nothing waiting on it, and was
+    reported "still running" once the loop that could reap it was gone."""
+    proc = await asyncio.create_subprocess_exec(
+        "sleep", "30", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    reading = asyncio.create_task(communicate(proc))
+    await asyncio.sleep(0.2)
+
+    reading.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    assert proc.returncode is not None, "killed and reaped, not left running"
+    assert proc._transport.is_closing(), "and its pipes released"

@@ -31,7 +31,7 @@ Mock-heavy tests pass straight through seams.
 | `test_manager.py` | Scheduling, dependencies, preemption, health, crash paths | Fake runner and workspace, injected clock |
 | `test_reconcile.py` | Recovery after a crash | **Real tmux, real git** - kills the server mid-run |
 | `test_tmux_runner.py` | Panes, pipes, process-tree kill, a lost `SIGCHLD` | **Real tmux**; a scripted one for the lost signal, which cannot be staged |
-| `test_processes.py` | A killed subprocess is reaped within a bound, even one that never exits | Real processes, and a stand-in for one that never exits |
+| `test_processes.py` | A killed or interrupted subprocess is reaped within a bound, even one that never exits | Real processes, and a stand-in for one that never exits |
 | `test_workspace.py` | Worktrees, checkpoints, merge, conflict | **Real git** |
 | `test_shutdown.py` | What survives a shutdown | **Real git** |
 | `test_web.py` | The dashboard | **Real uvicorn on a real socket** |
@@ -113,7 +113,7 @@ That is what makes `buddy update` able to re-run only what moved.
 - `ruff check`, `ruff format --check`, `mypy` and the suite are all clean, and CI keeps them so. Fix a type error by stating the real contract - `NoReturn`, a union, a guard - rather than a `type: ignore`.
 - A new command or option is documented in `docs/operating.md` in the same change; `test_docs.py` fails otherwise, and so does a new config key missing from `docs/configuration.md`.
 - A test waits on a condition, never on a guessed duration. Timing assertions compare events against each other, not against a clock: a slow CI runner is not a bug.
-- Every tmux and git call goes through `asyncio.create_subprocess_exec`, never `subprocess.run`.
+- Every tmux and git call goes through `asyncio.create_subprocess_exec` and `processes.communicate`, never `subprocess.run`: a read that is interrupted still kills and reaps its process.
 - Respect the layer table. A leak across it is a bug even when the tests pass.
 - A decision someone would otherwise undo - an order that looks backwards, a check that looks redundant - gets its reason next to it, in the code or in `docs/architecture.md`.
 - One logical change per commit, with a message that says why.

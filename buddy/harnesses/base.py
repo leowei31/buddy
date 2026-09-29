@@ -31,7 +31,7 @@ from buddy.config import (
     resolve_secrets,
 )
 from buddy.models import TaskRun
-from buddy.processes import kill_and_reap, release
+from buddy.processes import communicate
 from buddy.sandbox import sandboxed, wrap_in_sandbox
 
 #: The four requirements for driving a harness unattended. One that fails any is
@@ -180,12 +180,8 @@ async def run_command(
     )
     try:
         async with asyncio.timeout(seconds):
-            try:
-                out, err = await proc.communicate()
-            finally:
-                release(proc)
+            out, err = await communicate(proc)
     except TimeoutError:
-        await kill_and_reap(proc)
         return 124, "", f"{args[0]} did not answer within {seconds}s"
     return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
