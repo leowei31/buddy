@@ -17,7 +17,7 @@ import os
 import shlex
 import stat
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -51,10 +51,10 @@ from buddy.models import (
     default_agent_name,
     utcnow,
 )
-from buddy.sandbox import wrap_in_sandbox
+from buddy.sandbox import sandboxed, wrap_in_sandbox
 from buddy.state import Store
 from buddy.tmux_runner import PaneStatus, TmuxRunner
-from buddy.workspace import Workspace, WorkspaceError, branch_name
+from buddy.workspace import Workspace, WorkspaceError, branch_name, git_identity
 
 #: `cd` into the worktree failed. Distinct from any harness exit code so the
 #: log says plainly that the task never started.
@@ -257,11 +257,14 @@ def prepare_run(
     *,
     invocation_for: object,
     resolver: SecretResolver,
+    git_identity: Mapping[str, str],
 ) -> tuple[Path, Path]:
     """Write `prompt.md` and `run.sh` for one attempt.
 
     `invocation_for` is a `HarnessAdapter`; it is typed loosely here so the
     manager depends on the protocol rather than on any harness.
+    `git_identity` is who a sandboxed run commits as; required, so no caller
+    can leave a container unable to commit by forgetting it.
     """
     paths = config.paths
     prompt_path = paths.prompt_file(task.id)
@@ -281,6 +284,7 @@ def prepare_run(
             run.worktree,
             prompt_path=prompt_path,
             repo=config.project(task.project).path,
+            git_identity=git_identity,
         ),
         env=resolve_env(harness, resolver),
     )
@@ -676,7 +680,12 @@ class AgentManager:
         adapter = self.adapter_for(task.harness)
         try:
             _, script = prepare_run(
-                self.config, task, run, invocation_for=adapter, resolver=self.resolver
+                self.config,
+                task,
+                run,
+                invocation_for=adapter,
+                resolver=self.resolver,
+                git_identity=await self._commit_identity(task),
             )
         except Exception as exc:  # noqa: BLE001 - deterministic, so retrying cannot help
             # A secret nobody stored, a template that will not render: the
@@ -884,6 +893,14 @@ class AgentManager:
         await self.runner.kill(name)
         if task_id:
             remove_run_script(self.config.paths.run_script(task_id))
+
+    async def _commit_identity(self, task: TaskSpec) -> dict[str, str]:
+        """Who a sandboxed run commits as: the project's own git identity,
+        because its container has none. Not asked for any other run - git on
+        the host already knows."""
+        if not sandboxed(self.config.harness(task.harness)):
+            return {}
+        return await git_identity(self.config.project(task.project).path)
 
     # -- the tick ---------------------------------------------------
 

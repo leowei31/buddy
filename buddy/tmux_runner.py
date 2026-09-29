@@ -219,6 +219,17 @@ class TmuxRunner:
         await self.close_pipe(agent)
         await self._call("kill-window", "-t", self.target(agent))
 
+    def attach_command(self, agent: str | None = None) -> list[str]:
+        """The command that attaches a terminal, read-only, to one agent's
+        window, or to the whole session when no agent is named.
+
+        Returned rather than run, because attaching hands the caller's own
+        terminal to tmux - the CLI execs it - while what it says, down to
+        the socket and the exact-match target, stays this module's to know.
+        """
+        target = self.target(agent) if agent is not None else self._session_exact
+        return self._argv("attach", "-t", target, "-r")
+
     async def kill_session(self) -> None:
         """`buddy uninstall` and test teardown."""
         await self._call("kill-session", "-t", self._session_target)

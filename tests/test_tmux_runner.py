@@ -397,6 +397,43 @@ async def test_capture_shows_the_screen(runner: TmuxRunner, tmp_path: Path):
     assert "ON_SCREEN_NOW" in screen
 
 
+@pytest.mark.parametrize("agent", ["scout", None], ids=["one agent", "the session"])
+async def test_attaching_is_read_only_and_lands_where_asked(
+    runner: TmuxRunner, tmp_path: Path, agent: str | None
+):
+    """What `buddy watch` and `buddy attach` exec, run from a real terminal:
+    tmux itself reports the client read-only, and on the agent's window."""
+    await runner.spawn("fixer", make_run(tmp_path, "fixer"), script(tmp_path, "sleep 30", "b.sh"))
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "sleep 30"))
+    await runner._tmux("select-window", "-t", runner.target("fixer"))
+    terminal, tty = os.openpty()
+    env = {key: value for key, value in os.environ.items() if key != "TMUX"}
+    client = await asyncio.create_subprocess_exec(
+        *runner.attach_command(agent),
+        stdin=tty,
+        stdout=tty,
+        stderr=tty,
+        env=env | {"TERM": "xterm"},
+    )
+    os.close(tty)
+    try:
+        seen = await wait_for(lambda: _clients(runner))
+        assert seen == [("1", "scout" if agent else "fixer")]
+    finally:
+        await runner._call("detach-client", "-s", runner.session)
+        with contextlib.suppress(ProcessLookupError):
+            client.kill()
+        await client.wait()
+        os.close(terminal)
+
+
+async def _clients(runner: TmuxRunner) -> list[tuple[str, str]]:
+    """Each attached client: read-only or not, and the window it is on."""
+    out = await runner._tmux("list-clients", "-F", "#{client_readonly}\t#{window_name}")
+    rows = (line.split("\t", 1) for line in out.splitlines() if line)
+    return [(read_only, window) for read_only, window in rows]
+
+
 async def _captured(runner: TmuxRunner, agent: str, needle: str) -> str | None:
     screen = await runner.capture(agent)
     return screen if needle in screen else None

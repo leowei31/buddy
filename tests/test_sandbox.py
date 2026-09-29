@@ -14,6 +14,7 @@ construction and never by observation.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import pty
 import shutil
@@ -25,6 +26,7 @@ import pytest
 from buddy.config import HarnessConfig
 from buddy.harnesses.base import BaseAdapter
 from buddy.sandbox import DEFAULT_SANDBOX_COMMAND, wrap_in_sandbox
+from buddy.workspace import git_identity
 
 #: Small, ubiquitous, and enough to prove a mount boundary. Any image with a
 #: shell will do, so `BUDDY_TEST_IMAGE` can name one already on the machine -
@@ -480,6 +482,7 @@ def test_the_agent_can_commit_on_its_branch_from_inside_the_sandbox(worktree_tas
         worktree,
         prompt_path=prompt,
         repo=repo,
+        git_identity=asyncio.run(git_identity(repo)),
     )
 
     result = subprocess.run(
@@ -509,6 +512,7 @@ def test_the_agent_commits_under_the_repositorys_own_identity(worktree_task, ima
         worktree,
         prompt_path=prompt,
         repo=repo,
+        git_identity=asyncio.run(git_identity(repo)),
     )
 
     subprocess.run(["bash", "-c", line], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
@@ -539,6 +543,7 @@ def test_the_agent_cannot_leave_a_hook_that_runs_on_your_machine(worktree_task, 
         worktree,
         prompt_path=prompt,
         repo=repo,
+        git_identity=asyncio.run(git_identity(repo)),
     )
 
     subprocess.run(["bash", "-c", line], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)

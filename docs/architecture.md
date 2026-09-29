@@ -45,7 +45,8 @@ One module knows each external thing, and no other module may.
 | `web/server.py` | HTTP and websockets. |
 
 A leak across those lines is a bug even when the tests pass.
-It is why the manager asks an adapter to `describe_activity()` rather than parsing JSON itself, and why setup's package step asks `tmux_runner` for tmux's version instead of running `tmux -V`.
+It is why the manager asks an adapter to `describe_activity()` rather than parsing JSON itself, why setup's package step asks `tmux_runner` for tmux's version instead of running `tmux -V`, and why `buddy watch` execs a command line `tmux_runner` wrote.
+A sandboxed run's git identity is asked of `workspace.py` for the same reason, and handed to the sandbox as data.
 
 ## The module map
 

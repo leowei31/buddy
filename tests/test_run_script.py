@@ -430,7 +430,7 @@ def test_prepare_run_writes_both_files(tmp_path: Path):
     run = make_run(tmp_path)
 
     prompt_path, script_path = prepare_run(
-        config, task, run, invocation_for=adapter, resolver=EnvSecretResolver()
+        config, task, run, invocation_for=adapter, resolver=EnvSecretResolver(), git_identity={}
     )
 
     assert prompt_path == config.paths.prompt_file("t-0142")
@@ -465,6 +465,7 @@ def test_a_sandboxed_run_can_actually_read_its_brief(tmp_path: Path):
         run,
         invocation_for=ClaudeCodeAdapter(config.harness("claude_code")),
         resolver=EnvSecretResolver(),
+        git_identity={},
     )
 
     body = script_path.read_text()

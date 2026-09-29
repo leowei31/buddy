@@ -18,6 +18,7 @@ from buddy.workspace import (
     Workspace,
     WorkspaceError,
     branch_name,
+    git_identity,
     slugify,
 )
 
@@ -106,6 +107,13 @@ def test_branch_name_carries_the_task_id():
 
 
 # -- creating worktrees --------------------------------------------
+
+
+async def test_git_identity_is_the_repositorys_own(repo: Path, tmp_path: Path):
+    """What a sandboxed run commits as, since its container has no
+    `~/.gitconfig`. Never raises: a checkout that is gone gives nothing."""
+    assert await git_identity(repo) == {"user.name": "Test", "user.email": "test@example.com"}
+    assert await git_identity(tmp_path / "gone") == {}
 
 
 async def test_create_makes_a_worktree_on_its_own_branch(workspace: Workspace, repo: Path):

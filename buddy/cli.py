@@ -1309,11 +1309,12 @@ def memory_rm(memory_id: int) -> None:
 # --------------------------------------------------------------------------
 
 
-def _exec_tmux(*args: str) -> None:
-    tmux = shutil.which("tmux")
-    if not tmux:
-        fail("tmux is not installed")
-    os.execvp(tmux, [tmux, *args])  # noqa: S606 - handing the terminal to tmux is the point
+def _exec(argv: list[str]) -> None:
+    """Hand this terminal to `argv`, which `tmux_runner` wrote."""
+    found = shutil.which(argv[0])
+    if not found:
+        fail(f"{argv[0]} is not installed")
+    os.execvp(found, [found, *argv[1:]])  # noqa: S606 - handing the terminal to tmux is the point
 
 
 @app.command(help="Attach to one agent's terminal, read-only. Ctrl-b d detaches.")
@@ -1322,13 +1323,13 @@ def watch(agent: str) -> None:
     runtime = Runtime()
     name = _running_agent(runtime, agent).name
     runtime.store.close()
-    _exec_tmux("attach", "-t", f"{TmuxRunner.SESSION}:={name}", "-r")
+    _exec(runtime.runner.attach_command(name))
 
 
 @app.command(help="Attach to every agent's window, read-only. Ctrl-b w switches windows.")
 def attach() -> None:
     """Attach to the session, read-only. Ctrl-b w switches windows."""
-    _exec_tmux("attach", "-t", f"={TmuxRunner.SESSION}", "-r")
+    _exec(TmuxRunner().attach_command())
 
 
 @app.command(help="Print or follow a task's output without attaching.")

@@ -7,6 +7,7 @@ is that the refusals refuse, with a message that says what to do.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -404,6 +405,44 @@ async def _usable_report(self):
     return PreflightReport(
         harness="claude_code", binary="/bin/true", requirements=(Requirement("headless", True),)
     )
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+def test_watch_and_attach_exec_the_command_tmux_runner_wrote(home: Path, monkeypatch):
+    """Only `tmux_runner` writes a tmux command line. These two hand the
+    terminal to exactly that one - `watch` resolving the name first."""
+    from buddy import cli
+    from buddy.models import Agent, TaskSpec, TaskState
+    from buddy.tmux_runner import TmuxRunner
+
+    runtime = cli.Runtime()
+    runtime.store.create_task(
+        TaskSpec(
+            id="t-0001",
+            title="a",
+            brief="b",
+            harness="claude_code",
+            project="webapp",
+            priority=3,
+            agent="scout",
+        ),
+        TaskState.RUNNING,
+    )
+    runtime.store.save_agent(Agent(name="scout", task_id="t-0001", run_attempt=1))
+    runtime.store.close()
+    handed: list[list[str]] = []
+
+    def execvp(_path: str, argv: list[str]) -> None:
+        handed.append(argv[1:])
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli.os, "execvp", execvp)
+
+    assert runner.invoke(app, ["watch", "Scout"]).exit_code == 0
+    assert runner.invoke(app, ["attach"]).exit_code == 0
+
+    tmux = TmuxRunner()
+    assert handed == [tmux.attach_command("scout")[1:], tmux.attach_command()[1:]]
 
 
 async def test_merge_and_discard_from_the_cli_wait_for_a_running_task(home: Path, capsys):

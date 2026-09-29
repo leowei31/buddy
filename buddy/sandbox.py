@@ -9,7 +9,7 @@ sandboxed harness that is inside the image, not on this machine.
 from __future__ import annotations
 
 import shlex
-import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 from buddy.config import HarnessConfig, fill_template
@@ -82,8 +82,9 @@ GIT_READ_ONLY = ("config", "hooks")
 
 #: Identity for the agent's own commits. A container has no `~/.gitconfig`,
 #: so git refused every commit with "Please tell me who you are" - measured.
-#: Taken from the repository itself, so a sandboxed commit is attributed
-#: exactly as an unsandboxed one, and nothing but these two values crosses.
+#: Taken from the repository itself (`workspace.git_identity`), so a
+#: sandboxed commit is attributed exactly as an unsandboxed one, and nothing
+#: but these two values crosses.
 GIT_IDENTITY = (
     ("user.name", ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")),
     ("user.email", ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL")),
@@ -125,43 +126,20 @@ def common_git_dir(checkout: Path) -> Path | None:
     return (gitdir / common).resolve() if common else gitdir
 
 
-def git_identity(repo: Path) -> dict[str, str]:
-    """`user.name` and `user.email` as git resolves them for this checkout.
-
-    Asked of git, unlike the path above, because the answer is not written
-    down anywhere to read: it is whichever of the repository, global and
-    system configurations sets the key first, and only git knows the order.
-    Asked in the project's own checkout, for the reason `common_git_dir`
-    gives.
-
-    Never raises and never waits long: without an identity the agent cannot
-    commit, but that is not a reason to fail the run before it starts.
-    """
-    found: dict[str, str] = {}
-    for key, names in GIT_IDENTITY:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo), "config", "--get", key],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                stdin=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        value = result.stdout.strip()
-        if result.returncode == 0 and value:
-            found.update(dict.fromkeys(names, value))
-    return found
-
-
-def git_support(repo: Path | None, worktree: Path | None = None) -> str:
+def git_support(
+    repo: Path | None,
+    worktree: Path | None = None,
+    identity: Mapping[str, str] | None = None,
+) -> str:
     """The `docker run` flags that make git work inside the container.
 
     `repo` is the project's own checkout, which is where the git directory
     is learned from - never the worktree, which the agent controls. Empty
     when there is none, or it is not a checkout: a project that is not a git
     repository runs in place and has no branch to commit to.
+
+    `identity` is the repository's `user.name` and `user.email`, as
+    `workspace.git_identity` found them.
     """
     if repo is None or (common := common_git_dir(repo)) is None:
         return ""
@@ -174,7 +152,13 @@ def git_support(repo: Path | None, worktree: Path | None = None) -> str:
         if path.exists():
             quoted = shlex.quote(str(path))
             flags.append(f" -v {quoted}:{quoted}:ro")
-    for name, value in sorted(git_identity(repo).items()):
+    variables = {
+        name: value
+        for key, names in GIT_IDENTITY
+        if (value := (identity or {}).get(key))
+        for name in names
+    }
+    for name, value in sorted(variables.items()):
         flags.append(f" -e {shlex.quote(f'{name}={value}')}")
     return "".join(flags)
 
@@ -186,6 +170,7 @@ def wrap_in_sandbox(
     *,
     prompt_path: Path | None = None,
     repo: Path | None = None,
+    git_identity: Mapping[str, str] | None = None,
 ) -> str:
     """The recommended second isolation boundary, off by default.
 
@@ -194,7 +179,8 @@ def wrap_in_sandbox(
     agent that decides to `rm -rf` something can only reach what was mounted.
 
     `repo` is the project's own checkout, for the git directory the worktree
-    belongs to. None for a probe, which has no repository.
+    belongs to, and `git_identity` who commits there. None for a probe,
+    which has no repository.
     """
     if harness.sandbox != "docker" or not harness.sandbox_command:
         return command
@@ -204,7 +190,7 @@ def wrap_in_sandbox(
     return fill_template(
         harness.sandbox_command,
         worktree=shlex.quote(str(worktree)),
-        git=git_support(repo, worktree),
+        git=git_support(repo, worktree, git_identity),
         env=env_flags,
         # One argument, so the shell inside the container sees the whole line.
         command=shlex.quote(command),

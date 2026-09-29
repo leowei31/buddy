@@ -110,6 +110,56 @@ async def git_version() -> tuple[int, ...]:
     return tuple(int(part) for part in match.groups() if part is not None)
 
 
+async def git_identity(repo: Path) -> dict[str, str]:
+    """Who commits in `repo`: its `user.name` and `user.email`, those that
+    are set, keyed by name.
+
+    A sandboxed run needs them, because its container has no `~/.gitconfig`
+    and git there refuses to commit at all. Asked of git rather than read
+    from a file: the answer is whichever of the repository, global and
+    system configurations sets the key first, and only git knows the order.
+    Asked of the project's own checkout, never of a task's worktree, whose
+    `.git` the agent can rewrite.
+
+    Never raises: without an identity the agent cannot commit, but that is
+    not a reason to fail the run before it starts.
+    """
+    found: dict[str, str] = {}
+    for key in ("user.name", "user.email"):
+        try:
+            code, out, _ = await _run_git(repo, "config", "--get", key)
+        except OSError:
+            continue
+        if code == 0 and out.strip():
+            found[key] = out.strip()
+    return found
+
+
+async def _run_git(
+    repo: Path, *args: str, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
+    """`git -C repo ...`, never interactive: its code, stdout and stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(repo),
+        *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **GIT_ENV, **(env or {})},
+    )
+    try:
+        out, err = await proc.communicate()
+    finally:
+        release(proc)
+    return (
+        proc.returncode or 0,
+        out.decode(errors="replace"),
+        err.decode(errors="replace"),
+    )
+
+
 def slugify(title: str, *, max_length: int = 40) -> str:
     """A branch-safe slug for `buddy/<task_id>-<slug>`.
 
@@ -190,25 +240,7 @@ class Workspace:
     async def _git_status(
         self, repo: Path, *args: str, env: dict[str, str] | None = None
     ) -> tuple[int, str, str]:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "-C",
-            str(repo),
-            *args,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, **GIT_ENV, **(env or {})},
-        )
-        try:
-            out, err = await proc.communicate()
-        finally:
-            release(proc)
-        return (
-            proc.returncode or 0,
-            out.decode(errors="replace"),
-            err.decode(errors="replace"),
-        )
+        return await _run_git(repo, *args, env=env)
 
     # -- git in a task's worktree, where the agent has been -----------------
 

@@ -7,7 +7,9 @@ what is under test here is the manager's decisions.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from buddy.models import (
     TaskState,
     utcnow,
 )
+from buddy.sandbox import DEFAULT_SANDBOX_COMMAND
 from buddy.state import Store
 from buddy.tmux_runner import PaneStatus
 from buddy.workspace import Checkout, WorkspaceError
@@ -1298,3 +1301,49 @@ async def test_a_dead_pane_that_never_says_how_it_ended_is_still_finalized(
 
     assert finished.exit_code == -1
     assert store.get_task_state(task.id) is TaskState.ERROR
+
+
+# -- a sandboxed run's git identity ------------------------------------------
+
+
+def _sandboxed(tmp_path: Path, repo: Path) -> Config:
+    """The test config with its harness in a container, and its project a
+    real repository that commits as You."""
+    repo.mkdir(parents=True)
+    for args in (
+        ["init", "-q"],
+        ["config", "user.name", "You"],
+        ["config", "user.email", "you@example.com"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    config = tmp_path / "config.toml"
+    config.write_text(
+        config.read_text()
+        + f"sandbox = \"docker\"\nsandbox_command = '{DEFAULT_SANDBOX_COMMAND}'\n"
+    )
+    return Config.load(home=tmp_path)
+
+
+async def test_a_sandboxed_run_commits_as_its_project_does(
+    config, tmp_path, store, runner, workspace, clock, manager
+):
+    """A container has no `~/.gitconfig`, and git there refuses to commit.
+    The project's own identity, asked of git by the workspace, reaches the
+    run's script - and a run that is not sandboxed never asks."""
+    boxed = _sandboxed(tmp_path, config.project("webapp").path)
+    sandboxed = AgentManager(
+        boxed,
+        store,
+        runner,
+        workspace,
+        adapter_for=lambda name: ClaudeCodeAdapter(boxed.harness(name)),
+        now=clock,
+    )
+    task = make_task(store)
+
+    await sandboxed.submit(task)
+
+    script = await asyncio.to_thread(boxed.paths.run_script(task.id).read_text)
+    for variable in ("GIT_AUTHOR_NAME=You", "GIT_COMMITTER_EMAIL=you@example.com"):
+        assert f"-e {variable}" in script
+    assert await manager._commit_identity(task) == {}
