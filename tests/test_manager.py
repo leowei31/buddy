@@ -1221,3 +1221,42 @@ async def test_a_running_task_is_still_working(manager, store, runner):
     runner.finish("scout", 0)
     await manager.tick()
     assert manager.still_working(task.id) is None
+
+
+# -- a dead pane without an exit status --------------------------------------
+
+
+@pytest.mark.parametrize(("code", "state"), [(0, TaskState.DONE), (3, TaskState.ERROR)])
+async def test_a_dead_pane_with_no_status_is_read_from_the_log(
+    manager, store, runner, config, code, state
+):
+    """tmux has no exit status for a process killed by a signal, and on Linux
+    a task that had finished was recorded as an error with exit code -1. The
+    wrapper's DONE line carries the harness's exit code for exactly this."""
+    from buddy.logs import DONE_SENTINEL
+
+    task = make_task(store)
+    await manager.submit(task)
+    write_log(
+        store, config, task.id, f"working\n{DONE_SENTINEL} {task.id} {code} 2026-01-01T00:00:00Z\n"
+    )
+    runner.panes_state[task.agent] = PaneStatus(exists=True, dead=True, exit_code=None, signal=1)
+
+    [finished] = kinds(await manager.tick(), TaskFinished)
+
+    assert finished.exit_code == code
+    assert store.get_task_state(task.id) is state
+
+
+async def test_a_pane_killed_by_a_signal_before_it_finished_reports_the_signal(
+    manager, store, runner, config
+):
+    task = make_task(store)
+    await manager.submit(task)
+    write_log(store, config, task.id, "working, and then nothing\n")
+    runner.panes_state[task.agent] = PaneStatus(exists=True, dead=True, exit_code=None, signal=9)
+
+    [finished] = kinds(await manager.tick(), TaskFinished)
+
+    assert finished.exit_code == 137, "128 + SIGKILL, as a shell would say"
+    assert store.get_task_state(task.id) is TaskState.ERROR

@@ -139,19 +139,27 @@ async def test_a_run_that_finished_while_buddy_was_down_is_finalized(
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    await wait_for(lambda: _dead(first, task.agent))
+    pane = await wait_for(lambda: _dead(first, task.agent))
     first.close()
 
     second = Buddy(config, socket)
     events = await second.manager.reconcile()
 
-    assert second.store.get_task_state(task.id) is TaskState.DONE
+    assert second.store.get_task_state(task.id) is TaskState.DONE, evidence(config, task, pane)
     assert second.store.get_run(task.id, 1).outcome is RunOutcome.DONE
     assert config.paths.result_file(task.id).exists()
     assert second.store.get_agent(task.agent) is None, "the agent is retired"
     assert not await second.runner.window_exists(task.agent), "and its window is gone"
     assert events
     second.close()
+
+
+def evidence(config: Config, task: TaskSpec, pane=None) -> str:
+    """What a failure here needs to be diagnosed from an annotation alone:
+    the pane as tmux last reported it, and the attempt's log."""
+    log = config.paths.log_file(task.id, 1)
+    text = log.read_text() if log.exists() else "(no log)"
+    return f"pane={pane!r}\nlog:\n{text[-1500:]}"
 
 
 async def _dead(buddy: Buddy, agent: str):
@@ -164,14 +172,14 @@ async def test_a_failed_run_is_finalized_as_an_error(tmp_path: Path, repo: Path,
     first = Buddy(config, socket)
     task = make_task(first.store)
     await first.manager.submit(task)
-    await wait_for(lambda: _dead(first, task.agent))
+    pane = await wait_for(lambda: _dead(first, task.agent))
     first.close()
 
     second = Buddy(config, socket)
     await second.manager.reconcile()
 
     assert second.store.get_task_state(task.id) is TaskState.ERROR
-    assert second.store.get_run(task.id, 1).exit_code == 3
+    assert second.store.get_run(task.id, 1).exit_code == 3, evidence(config, task, pane)
     second.close()
 
 

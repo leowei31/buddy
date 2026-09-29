@@ -583,12 +583,18 @@ async def test_the_whole_of_setup_against_this_machine(
 
     # A model that exists. Claude Code's own `sonnet` alias resolves to a
     # retired one, so a task naming no model would 404 on its first call -
-    # which is the first thing a new user would see.
-    harness = config.harnesses["claude_code"]
-    assert harness.default_model == "claude-sonnet-5"
-    assert "--model claude-sonnet-5" in harness.command.format(
-        prompt_path="p", worktree="w", model="claude-sonnet-5", model_flag="--model claude-sonnet-5"
-    )
+    # which is the first thing a new user would see. Only where Claude Code is
+    # installed: setup configures the harnesses a machine has, and CI's has
+    # the others.
+    if shutil.which("claude"):
+        harness = config.harnesses["claude_code"]
+        assert harness.default_model == "claude-sonnet-5"
+        assert "--model claude-sonnet-5" in harness.command.format(
+            prompt_path="p",
+            worktree="w",
+            model="claude-sonnet-5",
+            model_flag="--model claude-sonnet-5",
+        )
 
     # And the second run does almost nothing, which is the promise.
     again = make_ctx(tmp_path, ui=ScriptedUI(), no_voice=not speech)

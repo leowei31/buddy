@@ -139,6 +139,20 @@ async def test_pane_goes_dead_and_reports_its_exit_code(
     assert status.exit_code == exit_code
 
 
+async def test_a_pane_killed_by_a_signal_reports_the_signal_not_a_status(
+    runner: TmuxRunner, tmp_path: Path
+):
+    """tmux gives no exit status for a process a signal ended. The manager
+    falls back to the log and then to the signal; this proves the signal
+    arrives."""
+    await runner.spawn("scout", make_run(tmp_path), script(tmp_path, "kill -TERM $$; sleep 5"))
+
+    status = await wait_for(lambda: _dead(runner, "scout"))
+
+    assert status.exit_code is None
+    assert status.signal == signal.SIGTERM
+
+
 async def _dead(runner: TmuxRunner, agent: str) -> PaneStatus | None:
     status = await runner.status(agent)
     return status if status.dead else None

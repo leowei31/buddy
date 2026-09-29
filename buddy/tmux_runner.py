@@ -57,9 +57,13 @@ class PaneStatus:
 
     exists: bool
     dead: bool = False
+    #: Set only for a process that exited. One killed by a signal has none -
+    #: tmux reports `signal` instead - which is why a dead pane with neither
+    #: is left to the log's own record of how it ended.
     exit_code: int | None = None
     pid: int | None = None
     piped: bool = False
+    signal: int | None = None
 
     @property
     def alive(self) -> bool:
@@ -317,7 +321,7 @@ class TmuxRunner:
             self._session_target,
             "-F",
             "#{window_name}\t#{pane_dead}\t#{pane_dead_status}\t"
-            "#{pane_pid}\t#{pane_pipe}\t#{pane_active}",
+            "#{pane_pid}\t#{pane_pipe}\t#{pane_active}\t#{pane_dead_signal}",
         )
         if code != 0:
             return {}
@@ -327,6 +331,8 @@ class TmuxRunner:
             if len(parts) < 6:
                 continue
             name, dead_raw, status_raw, pid_raw, pipe_raw, active_raw = parts[:6]
+            # Empty before tmux 3.2, which had no such format.
+            signal_raw = parts[6] if len(parts) > 6 else ""
             # Buddy gives a window exactly one pane, but a curious user can
             # split one by hand; the active pane is the task's.
             if name in found and active_raw != "1":
@@ -335,10 +341,12 @@ class TmuxRunner:
             found[name] = PaneStatus(
                 exists=True,
                 dead=dead,
-                # A live pane has no exit status; a dead one always does.
+                # A live pane has no exit status, and neither does one whose
+                # process was killed by a signal: that is `signal` instead.
                 exit_code=int(status_raw) if dead and status_raw.strip("-").isdigit() else None,
                 pid=int(pid_raw) if pid_raw.isdigit() else None,
                 piped=pipe_raw == "1",
+                signal=_signal_number(signal_raw) if dead else None,
             )
         return found
 
@@ -364,6 +372,18 @@ class TmuxRunner:
         if status.pid and not status.dead:
             await kill_process_tree(status.pid, grace=KILL_GRACE_SECONDS)
         await self.close_window(agent)
+
+
+def _signal_number(raw: str) -> int | None:
+    """`#{pane_dead_signal}` as a number. tmux prints the name - `term`,
+    `kill` - measured against tmux 3.7; a number is accepted as well."""
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        return int(signal.Signals[f"SIG{raw.upper()}"])
+    except KeyError:
+        return None
 
 
 # --------------------------------------------------------------------------

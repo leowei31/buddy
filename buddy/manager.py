@@ -53,7 +53,7 @@ from buddy.models import (
 )
 from buddy.sandbox import wrap_in_sandbox
 from buddy.state import Store
-from buddy.tmux_runner import TmuxRunner
+from buddy.tmux_runner import PaneStatus, TmuxRunner
 from buddy.workspace import Workspace, WorkspaceError, branch_name
 
 #: `cd` into the worktree failed. Distinct from any harness exit code so the
@@ -948,8 +948,31 @@ class AgentManager:
             # reachable at runtime too if someone closes the window.
             return await self._handle_missing_window(agent, task)
         if pane.dead:
-            return [await self._finalize(agent, task, pane.exit_code)]
+            return [await self._finalize(agent, task, self._exit_code(agent, task, pane))]
         return await self._check_health(agent, task)
+
+    #: A process killed by signal N exits, by shell convention, with 128 + N.
+    SIGNAL_EXIT_BASE = 128
+
+    def _exit_code(self, agent: Agent, task: TaskSpec, pane: PaneStatus) -> int | None:
+        """How a dead pane's attempt ended.
+
+        tmux's own status first. It has none for a process killed by a signal
+        - measured on Linux, where a finished task was recorded as an error
+        with exit code -1 - so next the wrapper's `__BUDDY_DONE__` line, which
+        carries the harness's exit code and exists for exactly this, and last
+        the signal itself, as a shell would report it.
+        """
+        if pane.exit_code is not None:
+            return pane.exit_code
+        run = self.store.get_run(task.id, agent.run_attempt)
+        log_path = run.log_path if run else self.config.paths.log_file(task.id, task.attempt)
+        found = read_sentinels(log_path, task.id)
+        if found.finished and found.exit_code is not None:
+            return found.exit_code
+        if pane.signal is not None:
+            return self.SIGNAL_EXIT_BASE + pane.signal
+        return None
 
     async def _finalize(self, agent: Agent, task: TaskSpec, exit_code: int | None) -> Event:
         run = self.store.get_run(task.id, agent.run_attempt)
@@ -1101,7 +1124,7 @@ class AgentManager:
             elif pane is None or not pane.exists:
                 events.extend(await self._handle_missing_window(agent, task))
             elif pane.dead:
-                events.append(await self._finalize(agent, task, pane.exit_code))
+                events.append(await self._finalize(agent, task, self._exit_code(agent, task, pane)))
             else:
                 # Alive: resume monitoring, and make sure the log pipe is open
                 # so the next tick's stall detection has something to read.
